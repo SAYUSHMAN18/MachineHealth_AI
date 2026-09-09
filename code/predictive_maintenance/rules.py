@@ -8,7 +8,7 @@ import pandas as pd
 import yaml
 
 
-DEFAULT_RULES_PATH = Path(__file__).resolve().parents[2] / "configs" / "rules.yaml"
+DEFAULT_RULES_PATH = Path(__file__).resolve().parents[2] / "config" / "rules.yaml"
 
 
 def load_rules(path: str | Path | None = None) -> dict:
@@ -146,6 +146,7 @@ def evaluate_sos_rules(sos: pd.DataFrame, rules_path: str | Path | None = None) 
 
         rows.append(
             {
+                "source_row": sample.get("source_row"),
                 "sample_number": sample.get("sample_number"),
                 "asset_id": asset_id,
                 "serial_number": sample.get("serial_number"),

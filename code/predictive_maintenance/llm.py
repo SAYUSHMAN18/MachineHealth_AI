@@ -26,6 +26,13 @@ def _generate_fallback_insights(analysis_result: dict[str, Any]) -> str:
         p3_count = int((alerts["priority_tier"] == "P3 \u2013 Action Required").sum())
         dq_count = int(alerts.get("is_invalid_date", pd.Series(False, index=alerts.index)).sum())
 
+    probability_notice = (
+        "> **Important**: `OverallInterp=AR` is a laboratory flag, not the model target. "
+        "Displayed probabilities come only from the independently labelled, chronologically tested model."
+        if operating_mode == _MODE_PREDICTION
+        else "> **Important**: `OverallInterp=AR` is a laboratory flag. It is **not** a failure prediction. "
+        "No failure probability is calculated in this report."
+    )
     lines = [
         "# Maintenance Triage Summary",
         "",
@@ -39,8 +46,7 @@ def _generate_fallback_insights(analysis_result: dict[str, Any]) -> str:
         f"- **P3 Action Required (New, No WO)**: {p3_count}",
         f"- **Records With Invalid Sample Dates**: {dq_count}",
         "",
-        "> **Important**: `OverallInterp=AR` is a laboratory flag. It is **not** a failure prediction. "
-        "No failure probability is calculated in this report.",
+        probability_notice,
         "",
         "---",
         "",
@@ -95,15 +101,15 @@ def _generate_fallback_insights(analysis_result: dict[str, Any]) -> str:
 
     unlock_msg = {
         _MODE_ALERT: "Resolve the BLOCKED gates above; alert-only data cannot unlock failure prediction.",
-        _MODE_CONDITION: "Add sufficient explicit corrective outcomes and matching telemetry, then pass chronological validation.",
-        _MODE_PREDICTION: "All prediction-readiness gates are PASS — ML failure prediction is active.",
+        _MODE_CONDITION: "Add sufficient explicit corrective outcomes, then pass chronological validation. Telemetry remains optional enrichment.",
+        _MODE_PREDICTION: "All required prediction-readiness gates are PASS — ML failure prediction is active; telemetry is used where available.",
     }.get(operating_mode, "")
     if unlock_msg:
         lines.extend(["", f"> **Next requirement**: {unlock_msg}"])
 
     lines.extend([
         "", "---",
-        "*Deterministic evidence summary only; no diagnosis or failure probability is inferred.*",
+        "*Deterministic evidence summary; probabilities appear only when the validated prediction mode is active.*",
     ])
     return "\n".join(lines)
 

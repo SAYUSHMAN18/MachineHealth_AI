@@ -10,8 +10,25 @@ import pandas as pd
 TabularSource = str | Path | IO[bytes] | IO[str]
 
 
+def resolve_file_path(source: TabularSource) -> TabularSource:
+    if isinstance(source, (str, Path)):
+        p = Path(source)
+        if not p.exists():
+            candidates = ["SOSFluidAnalysisSample.xlsx", "SosFluidSample.xlsx"]
+            for cand in candidates:
+                alt = p.parent / cand
+                if alt.exists():
+                    return alt
+            if p.name == "WorkOrderSample.csv":
+                alt = p.parent.parent / "demo" / "Demo_WorkOrders.xlsx"
+                if alt.exists():
+                    return alt
+    return source
+
+
 def load_table(source: TabularSource) -> pd.DataFrame:
     """Load an Excel or CSV table from a path or uploaded file object."""
+    source = resolve_file_path(source)
     name = str(getattr(source, "name", source)).lower()
     if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(source)

@@ -14,7 +14,12 @@ from .data import (
     prepare_telemetry,
     prepare_work_orders,
 )
-from .features import RAW_MEASUREMENT_COLUMNS, build_training_table, telemetry_asset_summary
+from .features import (
+    RAW_MEASUREMENT_COLUMNS,
+    build_scoring_table,
+    build_training_table,
+    telemetry_asset_summary,
+)
 from .llm import generate_llm_insights
 from .models import score_telemetry_anomalies, train_failure_models
 from .rules import evaluate_sos_rules
@@ -59,10 +64,8 @@ def _select_operating_mode(readiness: pd.DataFrame) -> str:
         return MODE_ALERT
     gates = readiness.set_index("gate")["status"].to_dict()
     prediction_gates = [
-        "both_lab_classes",
-        "numeric_trends",
+        "lab_predictors",
         "explicit_wo_outcomes",
-        "matched_assets",
         "labelled_training_rows",
         "chronological_dates",
     ]
@@ -275,6 +278,11 @@ def _readiness_table(
     )
     repeated_numeric_series = int((numeric_series >= 3).sum())
     numeric_trends_ready = raw_measurements >= 3 and repeated_numeric_series >= 1
+    text = sos.get("interpretation_text", pd.Series("", index=sos.index)).fillna("").astype(str).str.strip()
+    text_rows = int(text.ne("").sum())
+    text_variants = int(text.loc[text.ne("")].nunique())
+    text_predictors_ready = text_rows >= 60 and text_variants >= 2
+    lab_predictors_ready = numeric_trends_ready or text_predictors_ready
 
     codes = set(sos["interpretation_code"].dropna().astype(str).str.upper().unique())
     has_both_classes = bool(len(codes) >= 2)
@@ -302,12 +310,19 @@ def _readiness_table(
 
     criteria = [
         (
+            "lab_predictors",
+            "Enough usable S.O.S predictors exist",
+            lab_predictors_ready,
+            f"{raw_measurements} numerical sample(s); {text_rows} interpretation-text sample(s) with {text_variants} distinct text value(s)",
+            "Failure Prediction",
+        ),
+        (
             "both_lab_classes",
-            "Normal and abnormal S.O.S samples both exist",
+            "Normal and abnormal S.O.S interpretation codes both exist (optional)",
             has_both_classes,
             f"{len(codes)} distinct code(s) — need ≥2 (e.g. A and AR)"
             if not has_both_classes else f"{len(codes)} distinct codes found ✓",
-            "Failure Prediction",
+            "Optional enrichment",
         ),
         (
             "numeric_trends",
@@ -325,10 +340,10 @@ def _readiness_table(
         ),
         (
             "matched_assets",
-            "S.O.S and telemetry IDs match across enough assets",
+            "S.O.S and telemetry IDs match across enough assets (optional)",
             has_telemetry_match,
             f"{len(matched_assets)} matched asset(s), covering {matched_sos_rows} S.O.S row(s) — need ≥5 assets and ≥30 rows",
-            "Failure Prediction",
+            "Optional enrichment",
         ),
         (
             "labelled_training_rows",
@@ -347,7 +362,8 @@ def _readiness_table(
     ]
     return pd.DataFrame(
         [
-            {"gate": gate, "criterion": name, "status": "PASS" if passed else "BLOCKED",
+            {"gate": gate, "criterion": name,
+             "status": "PASS" if passed else ("OPTIONAL" if required_for == "Optional enrichment" else "BLOCKED"),
              "detail": detail, "required_for": required_for}
             for gate, name, passed, detail, required_for in criteria
         ]
@@ -450,6 +466,7 @@ def analyze_frames(
     matched_assets = asset_intersection(sos, telemetry)
 
     # 5. Readiness & mode selection
+    scoring = build_scoring_table(sos, telemetry, work_orders)
     training = build_training_table(sos, telemetry, work_orders, horizon_days=horizon_days)
     readiness = _readiness_table(sos, telemetry, work_orders, matched_assets, training)
     operating_mode = _select_operating_mode(readiness)
@@ -462,29 +479,78 @@ def analyze_frames(
     trained_model = None
     leaderboard = None
     model_error: str | None = None
-    sample_model_probs: dict[str, float] = {}
+    sample_model_probs: dict[int, float] = {}
     top_features: list[str] = []
     telemetry_anomaly_scores: dict[str, float] = {}
 
     if operating_mode == MODE_PREDICTION:
-        telemetry = score_telemetry_anomalies(telemetry)
-        if not telemetry.empty and "telemetry_anomaly_score" in telemetry.columns:
-            for a_id, grp in telemetry.groupby("asset_id", dropna=False):
-                valid_scores = grp["telemetry_anomaly_score"].dropna()
-                if not valid_scores.empty:
-                    telemetry_anomaly_scores[str(a_id)] = float(valid_scores.iloc[-1])
         if training is not None and not training.empty:
             try:
                 trained_model, leaderboard = train_failure_models(training)
-                probs = trained_model.predict_proba(training)
-                for s_num, p in zip(training["sample_number"], probs):
-                    sample_model_probs[str(s_num)] = float(p)
-                importances = trained_model.get_feature_importances()
-                top_features = list(importances.keys())[:3]
+                utility_passed = bool(
+                    trained_model.metrics.get("passes_utility_gate", False)
+                )
+                readiness = pd.concat(
+                    [
+                        readiness,
+                        pd.DataFrame([{
+                            "gate": "heldout_model_utility",
+                            "criterion": "Selected model beats a no-feature baseline on newer data",
+                            "status": "PASS" if utility_passed else "BLOCKED",
+                            "detail": (
+                                f"Average-precision lift "
+                                f"{trained_model.metrics.get('average_precision_lift', 0.0):.3f}; "
+                                f"Brier skill "
+                                f"{trained_model.metrics.get('brier_skill_score', 0.0):.3f}"
+                            ),
+                            "required_for": "Failure Prediction",
+                        }]),
+                    ],
+                    ignore_index=True,
+                )
+                if utility_passed:
+                    # Anomaly scoring is secondary evidence, so avoid its cost
+                    # unless the supervised probability model is deployable.
+                    telemetry = score_telemetry_anomalies(telemetry)
+                    if not telemetry.empty and "telemetry_anomaly_score" in telemetry.columns:
+                        for a_id, grp in telemetry.groupby("asset_id", dropna=False):
+                            valid_scores = grp["telemetry_anomaly_score"].dropna()
+                            if not valid_scores.empty:
+                                telemetry_anomaly_scores[str(a_id)] = float(valid_scores.iloc[-1])
+                    # Score every current, dated S.O.S sample—not merely the subset
+                    # that had work-order coverage and could be used for training.
+                    probs = trained_model.predict_proba(scoring)
+                    for source_row, probability in zip(scoring["source_row"], probs):
+                        sample_model_probs[int(source_row)] = float(probability)
+                    importances = trained_model.get_feature_importances()
+                    top_features = list(importances.keys())[:3]
+                else:
+                    model_error = (
+                        "The selected model did not show enough improvement over a "
+                        "constant prevalence baseline on the untouched chronological test set."
+                    )
+                    predictive_risk_enabled = False
+                    numeric_gate = readiness.loc[
+                        readiness["gate"].eq("numeric_trends"), "status"
+                    ]
+                    operating_mode = (
+                        MODE_CONDITION
+                        if not numeric_gate.empty and numeric_gate.iloc[0] == "PASS"
+                        else MODE_ALERT
+                    )
+                    # Do not export or serve a model that failed the utility gate.
+                    trained_model = None
             except Exception as exc:
                 model_error = str(exc)
                 predictive_risk_enabled = False
-                operating_mode = MODE_CONDITION
+                numeric_gate = readiness.loc[
+                    readiness["gate"].eq("numeric_trends"), "status"
+                ]
+                operating_mode = (
+                    MODE_CONDITION
+                    if not numeric_gate.empty and numeric_gate.iloc[0] == "PASS"
+                    else MODE_ALERT
+                )
                 readiness = pd.concat(
                     [
                         readiness,
@@ -501,8 +567,13 @@ def analyze_frames(
 
     # 7. Build Maintenance Action Cards for every alert row
     maintenance_action_cards: list[dict[str, Any]] = []
+    scoring_by_source = (
+        scoring.set_index("source_row", drop=False).to_dict(orient="index")
+        if not scoring.empty else {}
+    )
 
     for _, alert_row in alerts.iterrows():
+        source_row = int(alert_row.get("source_row", -1))
         sample_num = str(alert_row.get("sample_number", ""))
         asset_id = str(alert_row.get("asset_id", "Unknown"))
         component = str(alert_row.get("component", "Unknown"))
@@ -513,9 +584,15 @@ def analyze_frames(
         priority_reason = str(alert_row.get("priority_reason", alert_row.get("priority_evidence", "")))
         rec_action = str(alert_row.get("recommended_action", ""))
         evidence_level = str(alert_row.get("evidence_level", "Rule match available"))
+        score_evidence = scoring_by_source.get(source_row, {})
+        data_sources = ["S.O.S."]
+        if float(score_evidence.get("telemetry_available", 0.0) or 0.0) > 0:
+            data_sources.append("telemetry")
+        if float(score_evidence.get("work_order_history_available", 0.0) or 0.0) > 0:
+            data_sources.append("work-order history")
 
         if predictive_risk_enabled:
-            model_prob = sample_model_probs.get(sample_num, None)
+            model_prob = sample_model_probs.get(source_row)
             anom_score = telemetry_anomaly_scores.get(asset_id, None)
             prob_pct: int | None = int(round(model_prob * 100)) if model_prob is not None else None
             if prob_pct is None:
@@ -539,6 +616,7 @@ def analyze_frames(
             drivers = _extract_sample_risk_drivers(alert_row, [])
 
         maintenance_action_cards.append({
+            "source_row": source_row,
             "sample_number": sample_num,
             "asset_id": asset_id,
             "component": component,
@@ -565,6 +643,9 @@ def analyze_frames(
             "failure_probability_pct": prob_pct,
             "risk_badge": risk_badge,
             "telemetry_anomaly_score": telemetry_anomaly_scores.get(asset_id),
+            "prediction_data_sources": ", ".join(data_sources),
+            "telemetry_available": "telemetry" in data_sources,
+            "work_order_history_available": "work-order history" in data_sources,
             # Backward-compat aliases
             "workflow_priority": priority_tier,
             "priority_evidence": priority_reason,
@@ -585,6 +666,7 @@ def analyze_frames(
         "telemetry_quality": telemetry_quality,
         "telemetry_summary": telemetry_asset_summary(telemetry),
         "work_orders": work_orders,
+        "scoring_table": scoring,
         "training_table": training,
         "maintenance_action_cards": cards_df,
         "predictive_cards": cards_df,
@@ -642,8 +724,12 @@ def run_analysis(
     result["telemetry_summary"].to_csv(output / "telemetry_asset_summary.csv", index=False)
     result["telemetry"].to_csv(output / "telemetry_cleaned_scored.csv", index=False)
     result["readiness"].to_csv(output / "model_readiness.csv", index=False)
+    result["scoring_table"].to_csv(output / "scoring_features.csv", index=False)
+    result["maintenance_action_cards"].to_csv(output / "sample_predictions.csv", index=False)
     if result["training_table"] is not None:
         result["training_table"].to_csv(output / "training_table.csv", index=False)
+    if result["trained_model"] is not None:
+        result["trained_model"].save(output / "failure_model.joblib")
 
     ai_insights = generate_llm_insights(
         result, api_key=api_key, allow_external=allow_external_ai
@@ -659,6 +745,8 @@ def run_analysis(
         "telemetry_rows_after_deduplication": len(result["telemetry"]),
         "telemetry_assets": result["telemetry"]["asset_id"].nunique(dropna=True),
         "matched_assets": result["matched_assets"],
+        "prediction_rows": int(result["maintenance_action_cards"]["failure_probability_pct"].notna().sum()),
+        "trained_model": result["trained_model"].name if result["trained_model"] is not None else None,
         "telemetry_quality": result["telemetry_quality"],
         "dataset_metrics": result["dataset_metrics"],
     }

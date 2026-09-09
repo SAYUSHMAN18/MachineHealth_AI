@@ -3,9 +3,9 @@ import numpy as np
 import pandas as pd
 
 from predictive_maintenance.data import load_table, prepare_sos, prepare_telemetry, prepare_work_orders
-from predictive_maintenance.features import build_training_table
+from predictive_maintenance.features import build_scoring_table, build_training_table
 from predictive_maintenance.llm import generate_llm_insights
-from predictive_maintenance.models import train_failure_models
+from predictive_maintenance.models import _heldout_utility_metrics, train_failure_models
 from predictive_maintenance.pipeline import (
     MODE_ALERT, MODE_CONDITION, MODE_PREDICTION,
     P1_IMMEDIATE, P1_WO_TRACKING, P2_REPEATED, P3_ACTION,
@@ -250,6 +250,101 @@ def test_right_censored_samples_are_not_labelled_negative():
     assert build_training_table(sos, telemetry, work_orders, horizon_days=30).empty
 
 
+def test_observation_end_is_applied_per_asset_when_supplied():
+    sos = prepare_sos(pd.DataFrame({
+        "SampleNum": ["S-A", "S-B"],
+        "EquipNum": ["EQ-A", "EQ-B"],
+        "Compartment": ["ENG", "ENG"],
+        "OverallInterp": ["A", "A"],
+        "DateSampled": ["2026-01-20", "2026-01-20"],
+        "Fe": [10, 10],
+    }))
+    telemetry, _ = prepare_telemetry(None)
+    work_orders = prepare_work_orders(pd.DataFrame({
+        "WorkOrderId": ["WO-A", "WO-B"],
+        "EquipmentId": ["EQ-A", "EQ-B"],
+        "Component": ["ENG", "ENG"],
+        "OpenedDate": ["2026-02-25", "2026-01-25"],
+        "ObservationEndDate": ["2026-02-28", "2026-02-01"],
+        "WorkOrderType": ["PREVENTIVE", "PREVENTIVE"],
+        "FailureConfirmed": [0, 0],
+    }))
+    labelled = build_training_table(sos, telemetry, work_orders, horizon_days=30)
+    assert set(labelled["asset_id"]) == {"EQ-A"}
+    assert labelled["corrective_wo_within_horizon"].eq(0).all()
+
+
+def test_optional_sources_do_not_block_scoring_or_create_false_negatives():
+    sos = prepare_sos(pd.DataFrame({
+        "SampleNum": ["S01", "S02", "S03", "S04"],
+        "EquipNum": ["EQ-LABELLED", "EQ-LABELLED", "EQ-UNLABELLED", "EQ-UNLABELLED"],
+        "Compartment": ["ENG"] * 4,
+        "OverallInterp": ["A", "AR", "A", "AR"],
+        "DateSampled": ["2025-01-01", "2025-02-01", "2025-01-01", "2025-02-01"],
+        "Fe": [10, 20, 12, 24],
+    }))
+    telemetry, _ = prepare_telemetry(None)
+    work_orders = prepare_work_orders(pd.DataFrame({
+        "WorkOrderId": ["WO-1", "WO-2"],
+        "EquipmentId": ["EQ-LABELLED", "EQ-LABELLED"],
+        "Component": ["ENG", "ENG"],
+        "OpenedDate": ["2025-02-15", "2025-04-15"],
+        "WorkOrderType": ["CORRECTIVE", "PREVENTIVE"],
+        "FailureConfirmed": [1, 0],
+    }))
+
+    scoring = build_scoring_table(sos, telemetry, work_orders)
+    assert len(scoring) == 4
+    assert scoring["telemetry_available"].eq(0).all()
+    assert scoring.loc[scoring["asset_id"].eq("EQ-UNLABELLED"), "work_order_history_available"].eq(0).all()
+    labelled_scoring = scoring[scoring["asset_id"].eq("EQ-LABELLED")].sort_values("sample_date")
+    assert labelled_scoring["iron_ppm_mean_3"].tolist() == [10.0, 15.0]
+
+    training = build_training_table(sos, telemetry, work_orders, horizon_days=30)
+    assert set(training["asset_id"]) == {"EQ-LABELLED"}
+
+
+def test_text_heavy_sos_is_a_valid_predictor_source_but_not_a_label():
+    rows = 60
+    result = analyze_frames(pd.DataFrame({
+        "SampleNum": [f"S{i:03d}" for i in range(rows)],
+        "EquipNum": [f"EQ-{i % 10}" for i in range(rows)],
+        "Compartment": ["ENG"] * rows,
+        "OverallInterp": ["AR"] * rows,
+        "InterpText": [
+            "Elevated iron wear; inspect and resample." if i % 2
+            else "Water contamination is suspected; resample."
+            for i in range(rows)
+        ],
+        "DateSampled": pd.date_range("2024-01-01", periods=rows, freq="7D"),
+    }))
+    gates = result["readiness"].set_index("gate")
+    assert gates.loc["lab_predictors", "status"] == "PASS"
+    assert gates.loc["numeric_trends", "status"] == "BLOCKED"
+    assert result["training_table"].empty
+    assert result["operating_mode"] == MODE_ALERT
+    scoring = result["scoring_table"]
+    assert scoring["lab_text_available"].eq(1).all()
+    assert scoring[["lab_text_wear_signal", "lab_text_coolant_signal"]].sum().sum() == rows
+
+
+def test_prediction_demo_runs_without_telemetry_and_scores_all_sos_rows():
+    result = analyze_frames(
+        load_table(ROOT / "data/demo/Demo_SOSFluidAnalysis.xlsx"),
+        telemetry_raw=None,
+        work_orders_raw=load_table(ROOT / "data/demo/Demo_WorkOrders.xlsx"),
+    )
+    assert result["operating_mode"] == MODE_PREDICTION
+    assert result["predictive_risk_enabled"]
+    assert result["matched_assets"] == set()
+    assert result["scoring_table"]["telemetry_available"].eq(0).all()
+    assert len(result["scoring_table"]) == len(result["sos"])
+    assert result["maintenance_action_cards"]["failure_probability_pct"].notna().all()
+    assert result["trained_model"].metrics["passes_utility_gate"]
+    utility_gate = result["readiness"].set_index("gate").loc["heldout_model_utility"]
+    assert utility_gate["status"] == "PASS"
+
+
 def test_model_training_uses_separate_chronological_calibration_block():
     rows = 90
     training = pd.DataFrame({
@@ -260,16 +355,39 @@ def test_model_training_uses_separate_chronological_calibration_block():
         "component": ["ENG" if i % 3 else "HYD" for i in range(rows)],
         "equipment_hours": np.arange(rows) * 10.0,
         "fluid_hours": np.arange(rows) % 20,
+        "future_only_feature": [0] * 75 + list(range(15)),
         "corrective_wo_within_horizon": [i % 2 for i in range(rows)],
-        "horizon_days": [30] * rows,
+        "horizon_days": [7] * rows,
     })
     model, leaderboard = train_failure_models(training)
     assert model.metrics["calibration_rows"] >= 8
     assert model.metrics["test_rows"] >= 8
+    assert model.metrics["embargo_days"] == 7
+    assert 0.10 <= model.metrics["decision_threshold"] <= 0.90
+    assert "precision_at_threshold" in model.metrics
+    assert "baseline_brier_score" in model.metrics
+    assert "passes_utility_gate" in model.metrics
+    assert model.metrics["asset_balanced_training"]
+    assert "future_only_feature" not in model.features
+    assert pd.Timestamp(model.metrics["calibration_start"]) < pd.Timestamp(model.metrics["test_start"])
     assert set(leaderboard["model"]) == {"logistic_regression", "random_forest"}
     probabilities = model.predict_proba(training.head(5))
     assert np.isfinite(probabilities).all()
     assert ((probabilities >= 0) & (probabilities <= 1)).all()
+
+
+def test_model_utility_gate_rejects_a_constant_no_skill_prediction():
+    y_true = pd.Series([0, 1] * 10)
+    probabilities = np.full(len(y_true), 0.5)
+    metrics = {
+        "average_precision": 0.5,
+        "brier_score": 0.25,
+        "recall_at_threshold": 1.0,
+    }
+    utility = _heldout_utility_metrics(y_true, probabilities, 0.5, metrics)
+    assert utility["average_precision_lift"] == 0.0
+    assert utility["brier_skill_score"] == 0.0
+    assert not utility["passes_utility_gate"]
 
 
 def test_cli_outputs_are_utf8_serializable(tmp_path):
@@ -301,10 +419,38 @@ def test_presentation_uses_current_mode_and_unique_cases():
     assert fleet["samples"] == 1051
 
 
+def test_case_probability_uses_latest_prediction_not_historical_maximum():
+    cards = pd.DataFrame({
+        "asset_id": ["EQ-1", "EQ-1"],
+        "component": ["ENG", "ENG"],
+        "priority_tier": [P1_IMMEDIATE, P3_ACTION],
+        "sample_date": ["2025-01-01", "2025-02-01"],
+        "failure_probability_pct": [90, 20],
+        "prediction_data_sources": ["S.O.S., telemetry", "S.O.S."],
+        "key_evidence": [["old"], ["latest"]],
+        "sample_number": ["S1", "S2"],
+        "machine_model": ["M", "M"],
+        "site_name": ["A", "A"],
+        "lab_status": ["Warning", "Warning"],
+        "action_needed": ["Inspect", "Review"],
+        "wo_id": [None, None],
+        "data_quality_status": ["Valid", "Valid"],
+        "data_quality_issue": ["", ""],
+    })
+    cases = build_case_table({
+        "maintenance_action_cards": cards,
+        "sos": pd.DataFrame(),
+        "telemetry": pd.DataFrame(),
+        "work_orders": pd.DataFrame(),
+    }, 30)
+    assert cases.iloc[0]["failure_probability_pct"] == 20
+    assert cases.iloc[0]["prediction_data_sources"] == "S.O.S."
+
+
 def test_streamlit_dashboard_smoke_and_current_mode():
     from streamlit.testing.v1 import AppTest
 
-    app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=90).run()
+    app = AppTest.from_file(str(ROOT / "code/app.py"), default_timeout=90).run()
     assert not app.exception
     metrics = {metric.label: metric.value for metric in app.metric}
     assert metrics["P1 cases today"] == "9"
@@ -318,7 +464,7 @@ def test_streamlit_dashboard_smoke_and_current_mode():
 def test_streamlit_matched_demo_runs_prediction_and_validation_page():
     from streamlit.testing.v1 import AppTest
 
-    app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=180).run()
+    app = AppTest.from_file(str(ROOT / "code/app.py"), default_timeout=180).run()
     next(item for item in app.radio if item.label == "Data source").set_value("Matched prediction demo")
     app.run(timeout=180)
     assert not app.exception

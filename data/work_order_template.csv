@@ -1,2 +1,0 @@
-WorkOrderId,EquipmentId,Component,OpenedDate,ClosedDate,ObservationEndDate,WorkOrderType,ProblemDescription,ActionTaken,FailureConfirmed
-WO-EXAMPLE-001,REPLACE-WITH-ASSET-ID,ENGINE,2026-01-15,2026-01-16,2026-03-31,Corrective,Example problem description,Example verified repair action,1

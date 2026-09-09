@@ -216,8 +216,18 @@ def build_case_table(result: dict[str, Any], horizon_days: int) -> pd.DataFrame:
         ).iloc[0]
         dated = group.loc[group["_sample_date"].notna()].sort_values("_sample_date")
         latest_date = dated["_sample_date"].max() if not dated.empty else pd.NaT
-        probability_values = pd.to_numeric(group.get("failure_probability_pct"), errors="coerce").dropna()
-        probability = float(probability_values.max()) if not probability_values.empty else np.nan
+        probability_rows = group.assign(
+            _probability=pd.to_numeric(group.get("failure_probability_pct"), errors="coerce")
+        ).dropna(subset=["_probability"])
+        if not probability_rows.empty:
+            latest_prediction = probability_rows.sort_values(
+                ["_date_rank", "_row_rank"], ascending=[False, False]
+            ).iloc[0]
+            probability = float(latest_prediction["_probability"])
+            prediction_data_sources = str(latest_prediction.get("prediction_data_sources", "S.O.S."))
+        else:
+            probability = np.nan
+            prediction_data_sources = str(selected.get("prediction_data_sources", "S.O.S."))
         evidence = selected.get("key_evidence", [])
         evidence_list = evidence if isinstance(evidence, list) else [str(evidence)]
         main_issue = next((str(item) for item in evidence_list if _has_value(item)), "Review laboratory interpretation")
@@ -241,6 +251,7 @@ def build_case_table(result: dict[str, Any], horizon_days: int) -> pd.DataFrame:
             "main_issue": main_issue,
             "failure_probability_pct": probability,
             "probability_display": f"{probability:.0f}% / {int(horizon_days)} days" if np.isfinite(probability) else "Not available",
+            "prediction_data_sources": prediction_data_sources,
             "wo_id": str(wo_id) if has_wo else "",
             "wo_status_display": "Linked — verify outcome" if has_wo else "No linked WO",
             "required_action": str(selected.get("action_needed", "")).removeprefix("Suggested engineering review:").strip(),
@@ -327,6 +338,7 @@ def build_validation_summary(result: dict[str, Any]) -> dict[str, Any] | None:
     except (TypeError, ValueError, IndexError):
         tn = fp = fn = tp = 0
     test_rows = int(metrics.get("test_rows", tn + fp + fn + tp))
+    threshold = float(metrics.get("decision_threshold", 0.5))
     return {
         "model_name": str(getattr(model, "name", "model")).replace("_", " ").title(),
         "test_rows": test_rows,
@@ -334,15 +346,30 @@ def build_validation_summary(result: dict[str, Any]) -> dict[str, Any] | None:
         "false_positive": fp,
         "false_negative": fn,
         "true_positive": tp,
-        "precision": float(metrics.get("precision_at_0_5", np.nan)),
-        "recall": float(metrics.get("recall_at_0_5", np.nan)),
-        "f1": float(metrics.get("f1_at_0_5", np.nan)),
+        "decision_threshold": threshold,
+        "precision": float(metrics.get("precision_at_threshold", np.nan)),
+        "recall": float(metrics.get("recall_at_threshold", np.nan)),
+        "f1": float(metrics.get("f1_at_threshold", np.nan)),
         "roc_auc": metrics.get("roc_auc"),
+        "average_precision": float(metrics.get("average_precision", np.nan)),
+        "baseline_average_precision": float(
+            metrics.get("baseline_average_precision", np.nan)
+        ),
+        "average_precision_lift": float(
+            metrics.get("average_precision_lift", np.nan)
+        ),
         "brier_score": float(metrics.get("brier_score", np.nan)),
+        "baseline_brier_score": float(
+            metrics.get("baseline_brier_score", np.nan)
+        ),
+        "brier_skill_score": float(metrics.get("brier_skill_score", np.nan)),
+        "passes_utility_gate": bool(metrics.get("passes_utility_gate", False)),
         "plain_language": (
             f"The selected model was tested on {test_rows} newer historical samples. It correctly "
             f"identified {tp} corrective event(s), missed {fn}, correctly classified {tn} no-event "
-            f"sample(s), and generated {fp} false alert(s) at the 0.50 decision threshold."
+            f"sample(s), and generated {fp} false alert(s) at the validation-selected "
+            f"{threshold:.2f} decision threshold. Probability output is enabled only because it "
+            f"also beat the no-feature baseline on this untouched test period."
         ),
     }
 
@@ -368,7 +395,7 @@ def build_quality_issues(result: dict[str, Any]) -> pd.DataFrame:
     if isinstance(sos, pd.DataFrame) and not sos.empty:
         unmatched_rows = int((~sos["asset_id"].astype(str).isin(matched)).sum())
         if unmatched_rows:
-            issues.append({"severity": "Warning", "issue": "S.O.S rows without matched telemetry", "count": unmatched_rows, "impact": "Telemetry evidence is not used for these records.", "fix": "Align EquipNum and TMSAssetID or provide an approved mapping table."})
+            issues.append({"severity": "Information", "issue": "S.O.S rows without matched telemetry", "count": unmatched_rows, "impact": "These records use the other available predictors; telemetry is optional.", "fix": "If telemetry exists for these machines, align EquipNum and TMSAssetID or provide an approved mapping table."})
     duplicates = int(telemetry_quality.get("duplicate_asset_timestamp_rows", 0) or 0)
     if duplicates:
         issues.append({"severity": "Information", "issue": "Duplicate telemetry asset/timestamp rows", "count": duplicates, "impact": "Duplicates were resolved by retaining the most recently modified record.", "fix": "Review source-system duplicate generation if the count grows."})

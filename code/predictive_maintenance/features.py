@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import re
 from typing import Any
 
 import numpy as np
@@ -22,6 +23,16 @@ RAW_MEASUREMENT_COLUMNS = [
     "tbn",
 ]
 
+TEXT_SIGNAL_PATTERNS = {
+    "lab_text_wear_signal": r"\bwear\b|\biron\b|\bcopper\b|\bchromium\b|\blead\b|\bmetal",
+    "lab_text_contamination_signal": r"\bcontamina|\bdirt\b|\bsilicon\b|\bingress\b|\bdebris\b",
+    "lab_text_coolant_signal": r"\bwater\b|\bcoolant\b|\bglycol\b|\bantifreeze\b",
+    "lab_text_fuel_signal": r"\bfuel\b|\bdilution\b",
+    "lab_text_degradation_signal": r"\bviscosity\b|\boxidation\b|\bacidity\b|\btbn\b|\bsoot\b",
+    "lab_text_urgent_signal": r"\bimmediate|\burgent|\bcritical|\bshutdown|\binspect now|\baction required",
+    "lab_text_resample_signal": r"\bresample|\bsample again|\bhistory needed|\bmore sample history",
+}
+
 
 def add_sos_trends(sos: pd.DataFrame) -> pd.DataFrame:
     out = sos.sort_values(["asset_id", "component", "sample_date"]).copy()
@@ -40,6 +51,11 @@ def add_sos_trends(sos: pd.DataFrame) -> pd.DataFrame:
             100
             * out[f"{column}_delta"]
             / out["fluid_hours_delta"].where(out["fluid_hours_delta"].gt(0))
+        )
+        # A short rolling average reduces sensitivity to one noisy laboratory
+        # result while remaining understandable to maintenance engineers.
+        out[f"{column}_mean_3"] = groups[column].transform(
+            lambda values: values.rolling(3, min_periods=1).mean()
         )
     return out
 
@@ -82,20 +98,24 @@ def telemetry_asset_summary(telemetry: pd.DataFrame) -> pd.DataFrame:
 def _telemetry_window_features(
     telemetry: pd.DataFrame, asset_id: str, sample_date: pd.Timestamp
 ) -> dict[str, float]:
+    missing = {
+        "telemetry_available": 0.0,
+        "operating_hours_7d": np.nan,
+        "operating_hours_30d": np.nan,
+        "operating_hours_90d": np.nan,
+        "distance_30d": np.nan,
+        "mean_utilization_30d": np.nan,
+        "telemetry_age_days": np.nan,
+    }
+    if telemetry is None or telemetry.empty:
+        return missing
+
     asset = telemetry[
         (telemetry["asset_id"].astype(str) == str(asset_id))
         & (telemetry["event_time"] <= sample_date)
     ].sort_values("event_time")
     if asset.empty:
-        return {
-            "telemetry_available": 0.0,
-            "operating_hours_7d": np.nan,
-            "operating_hours_30d": np.nan,
-            "operating_hours_90d": np.nan,
-            "distance_30d": np.nan,
-            "mean_utilization_30d": np.nan,
-            "telemetry_age_days": np.nan,
-        }
+        return missing
 
     result: dict[str, float] = {"telemetry_available": 1.0}
     latest = asset.iloc[-1]
@@ -126,25 +146,107 @@ def build_training_table(
     if work_orders is None or work_orders.empty:
         return pd.DataFrame()
 
-    samples = add_sos_trends(sos)
     label_source = work_orders.get(
         "failure_label_source", pd.Series("text_inferred", index=work_orders.index)
     )
     wo_df = work_orders[label_source.eq("explicit")].copy()
     if wo_df.empty:
         return pd.DataFrame()
-    has_wo = "asset_id" in wo_df.columns
+
+    # A missing work order can only mean "no event" when the asset is actually
+    # covered by the outcome extract. Assets with no WO coverage remain useful
+    # at scoring time, but must not silently become negative training examples.
+    covered_assets = set(wo_df["asset_id"].dropna().astype(str))
+    scoring = build_scoring_table(sos, telemetry, wo_df)
+    scoring = scoring[scoring["asset_id"].astype(str).isin(covered_assets)].copy()
+    if scoring.empty:
+        return pd.DataFrame()
+
     stated_observation_end = wo_df.get(
         "observation_end_date", pd.Series(pd.NaT, index=wo_df.index)
-    ).dropna()
-    observation_end = (
-        stated_observation_end.max()
-        if not stated_observation_end.empty
+    )
+    stated_by_asset = (
+        wo_df.assign(_observation_end=stated_observation_end)
+        .groupby(wo_df["asset_id"].astype(str))["_observation_end"]
+        .max()
+    )
+    stated_available = stated_observation_end.dropna()
+    extract_observation_end = (
+        stated_available.max()
+        if not stated_available.empty
         else wo_df["opened_date"].max()
     )
 
     rows: list[dict[str, Any]] = []
 
+    for _, sample in scoring.iterrows():
+        sample_date = sample["sample_date"]
+        asset_id = sample["asset_id"]
+        component = sample["component"]
+        if pd.isna(sample_date) or pd.isna(asset_id):
+            continue
+        sample_date = pd.Timestamp(sample_date)
+        asset_observation_end = stated_by_asset.get(str(asset_id), pd.NaT)
+        observation_end = (
+            asset_observation_end
+            if pd.notna(asset_observation_end)
+            else extract_observation_end
+        )
+        # Do not label a recent sample as negative when the full future horizon
+        # is not observable for this asset in the work-order extract.
+        if pd.isna(observation_end) or sample_date + timedelta(days=int(horizon_days)) > observation_end:
+            continue
+
+        future = wo_df[
+            (wo_df["asset_id"].astype(str) == str(asset_id))
+            & (wo_df["opened_date"] > sample_date)
+            & (wo_df["opened_date"] <= sample_date + timedelta(days=int(horizon_days)))
+            & wo_df["is_corrective"]
+            & wo_df["confirmed_failure"]
+        ]
+        if pd.notna(component) and wo_df["component"].notna().any():
+            future = future[future["component"].astype(str) == str(component)]
+
+        row = sample.to_dict()
+        row["corrective_wo_within_horizon"] = int(not future.empty)
+        row["horizon_days"] = int(horizon_days)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("sample_date").reset_index(drop=True)
+
+
+def build_scoring_table(
+    sos: pd.DataFrame,
+    telemetry: pd.DataFrame,
+    work_orders: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Build past-only features for every scoreable S.O.S observation.
+
+    Telemetry and work-order history are optional feature sources. Missing
+    modalities are represented explicitly instead of blocking a prediction.
+    Future work orders are never consulted here.
+    """
+    samples = add_sos_trends(sos)
+    if samples.empty:
+        return pd.DataFrame()
+
+    samples["lab_history_samples"] = (
+        samples.groupby(["asset_id", "component"], dropna=False).cumcount() + 1
+    )
+    telemetry_groups = {
+        str(asset_id): group.sort_values("event_time")
+        for asset_id, group in telemetry.groupby("asset_id", dropna=False)
+    } if telemetry is not None and not telemetry.empty else {}
+
+    wo_df = work_orders if work_orders is not None else pd.DataFrame()
+    wo_assets = (
+        set(wo_df["asset_id"].dropna().astype(str))
+        if not wo_df.empty and "asset_id" in wo_df.columns else set()
+    )
+
+    rows: list[dict[str, Any]] = []
     for _, sample in samples.iterrows():
         sample_date = sample["sample_date"]
         asset_id = sample["asset_id"]
@@ -152,37 +254,25 @@ def build_training_table(
         if pd.isna(sample_date) or pd.isna(asset_id):
             continue
         sample_date = pd.Timestamp(sample_date)
-        # Do not label a recent sample as negative when the full future horizon
-        # is not observable in the work-order extract.
-        if pd.isna(observation_end) or sample_date + timedelta(days=int(horizon_days)) > observation_end:
-            continue
+        asset_key = str(asset_id)
 
-        if has_wo:
-            future = wo_df[
-                (wo_df["asset_id"].astype(str) == str(asset_id))
-                & (wo_df["opened_date"] > sample_date)
-                & (wo_df["opened_date"] <= sample_date + timedelta(days=int(horizon_days)))
-                & wo_df["is_corrective"]
-                & wo_df["confirmed_failure"]
-            ]
-            if pd.notna(component) and wo_df["component"].notna().any():
-                future = future[future["component"].astype(str) == str(component)]
-
+        prior_count: float = np.nan
+        if asset_key in wo_assets:
             prior = wo_df[
-                (wo_df["asset_id"].astype(str) == str(asset_id))
+                (wo_df["asset_id"].astype(str) == asset_key)
                 & (wo_df["opened_date"] < sample_date)
                 & wo_df["is_corrective"]
                 & wo_df["confirmed_failure"]
             ]
             if pd.notna(component) and wo_df["component"].notna().any():
                 prior = prior[prior["component"].astype(str) == str(component)]
+            prior_count = float(len(prior))
 
-            target_label = int(not future.empty)
-            prior_count = int(len(prior))
-        else:
-            continue
-
+        measurements = [sample.get(column) for column in RAW_MEASUREMENT_COLUMNS]
+        measurement_count = int(sum(pd.notna(value) for value in measurements))
+        interpretation_text = str(sample.get("interpretation_text", "") or "").strip()
         row: dict[str, Any] = {
+            "source_row": int(sample.get("source_row", len(rows))),
             "sample_number": sample["sample_number"],
             "asset_id": asset_id,
             "sample_date": sample_date,
@@ -191,15 +281,28 @@ def build_training_table(
             "equipment_hours": sample["equipment_hours"],
             "fluid_hours": sample["fluid_hours"],
             "days_since_previous_sample": sample["days_since_previous_sample"],
+            "lab_history_samples": int(sample["lab_history_samples"]),
+            "lab_measurement_count": measurement_count,
+            "lab_numeric_available": float(measurement_count > 0),
+            "lab_interpretation_code": str(sample.get("interpretation_code", "") or "").upper(),
+            "lab_text_available": float(bool(interpretation_text)),
+            "lab_text_length_log": float(np.log1p(len(interpretation_text))),
+            "work_order_history_available": float(asset_key in wo_assets),
             "prior_corrective_wo_count": prior_count,
-            "corrective_wo_within_horizon": target_label,
-            "horizon_days": horizon_days,
         }
         for column in RAW_MEASUREMENT_COLUMNS:
             row[column] = sample[column]
             row[f"{column}_delta"] = sample[f"{column}_delta"]
             row[f"{column}_rate_100h"] = sample[f"{column}_rate_100h"]
-        row.update(_telemetry_window_features(telemetry, str(asset_id), sample_date))
+            row[f"{column}_mean_3"] = sample[f"{column}_mean_3"]
+        text_signal_count = 0.0
+        for feature, pattern in TEXT_SIGNAL_PATTERNS.items():
+            matched = float(bool(re.search(pattern, interpretation_text, flags=re.IGNORECASE)))
+            row[feature] = matched
+            text_signal_count += matched
+        row["lab_text_signal_count"] = text_signal_count
+        asset_telemetry = telemetry_groups.get(asset_key, pd.DataFrame())
+        row.update(_telemetry_window_features(asset_telemetry, asset_key, sample_date))
         rows.append(row)
 
     if not rows:

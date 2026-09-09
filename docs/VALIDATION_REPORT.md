@@ -10,9 +10,18 @@ The uploaded project was tested against `data/current/SosFluidSample.xlsx` and `
 - Removed the weighted rule/ML/anomaly score presented as probability.
 - Removed classifier-derived remaining-safe-days output.
 - Separated action priority from date-quality warnings.
-- Required explicit WO outcomes, both target classes, minimum sample counts and matched assets before prediction.
-- Added chronological train/calibration/test probability calibration.
+- Required explicit WO outcomes, both target classes and minimum labelled sample counts before prediction; telemetry is optional.
+- Added whole-date chronological train/calibration/test blocks with a prediction-horizon embargo.
+- Selected the candidate on validation data and reserved the final test block for the winner only.
+- Selected usable predictors from the training period only to remove future-availability leakage.
+- Added equal-machine sample weighting so heavily sampled assets do not dominate training.
+- Added a held-out utility gate: probability output is blocked unless the winner beats a no-feature prevalence baseline on average precision and Brier score, with non-zero recall.
 - Excluded right-censored samples whose full future prediction horizon is not observable.
+- Applied supplied observation-end dates per asset rather than using another asset's longer history.
+- Excluded machines outside the WO extract from training instead of treating missing WOs as negative outcomes.
+- Added compact interpretation-text signals for text-heavy S.O.S exports without using lab severity as the target.
+- Added source-availability flags, optional telemetry enrichment and sparse-telemetry suppression.
+- Scored all current dated S.O.S rows rather than only labelled training rows.
 - Made interpretation categorisation multi-label with exact supporting sentences.
 - Made external LLM processing explicit opt-in and identifier-free.
 - Escaped spreadsheet-derived HTML values.
@@ -55,10 +64,10 @@ The uploaded project was tested against `data/current/SosFluidSample.xlsx` and `
 ## Commands executed
 
 ```text
-PYTHONPATH=src python -m pytest -q
-Result: 17 passed
+PYTHONPATH=code python -m pytest -q
+Result: 23 passed
 
-python -m compileall -q app.py src tests
+python -m compileall -q code tests
 Result: passed with no errors
 
 python -m predictive_maintenance.cli analyze --sos data/current/SosFluidSample.xlsx --telemetry data/current/TelematicDataSample.xlsx --output <temporary-output>
@@ -66,6 +75,12 @@ Result: Alert Management; UTF-8 output files written successfully
 
 Streamlit AppTest
 Result: all five pages passed with no application exceptions in both supplied-data and matched-demo modes (10 page/mode combinations)
+
+No-telemetry end-to-end check
+Result: S.O.S + independently labelled WOs activated Failure Prediction, scored all 360/360 synthetic samples and saved failure_model.joblib. This validates execution, not real-world accuracy.
+
+Matched-demo utility-gate check
+Result: Logistic Regression passed; average-precision lift 0.644 and Brier skill 0.990 on the untouched chronological test block. This remains a synthetic execution check, not evidence of field accuracy.
 ```
 
 ## Remaining data limitations
@@ -76,4 +91,4 @@ Result: all five pages passed with no application exceptions in both supplied-da
 - WorkOrderId linkage is not a detailed or confirmed maintenance outcome.
 - 552 sample dates have no usable calendar date.
 
-The current deliverable is therefore an S.O.S alert-management and maintenance-triage application, not a validated failure-prediction model.
+The supplied current dataset therefore remains in Alert Management mode. The application now contains an availability-aware predictive model, but real-world predictive validity requires a materially larger explicit work-order outcome history.

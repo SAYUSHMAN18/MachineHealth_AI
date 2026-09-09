@@ -1,9 +1,9 @@
 # Data request — S·O·S oil analysis + work orders + asset master
 
-Hand this to whoever owns the oil-lab portal and the CMMS. Deliver **three CSV
-files** into `data/raw/` with these names. The loader (`pdm/data.py`) accepts the
-enterprise column names below *or* the canonical names in parentheses — if the
-source uses something else, rename on export.
+Hand this to whoever owns the oil-lab portal and the CMMS. Supply the files
+through the dashboard upload or place them under `data/current/`. The active
+loader (`code/predictive_maintenance/data.py`) accepts the enterprise column
+names below or the canonical names in parentheses.
 
 Ask for **24–36 months** of history and **every** sample, not just flagged ones —
 a model trained only on flagged samples never learns what normal looks like.
@@ -30,7 +30,7 @@ a model trained only on flagged samples never learns what normal looks like.
 | `Visc100 Oxidation Nitration TBN` | number | is the oil still doing its job |
 | `PQ` (`pq_index`) | number | large ferrous debris (catches what ICP misses) |
 | `OverallInterp` (`lab_code`) | A/B/AR/CR … | the lab's own severity call — the benchmark to beat |
-| `InterpText` (`interp_text`) | text | the chemist's prose diagnosis — mined into flags, and a weak-label source |
+| `InterpText` (`interp_text`) | text | the chemist's prose diagnosis — mined into predictor flags, never used as the failure target |
 | `WorkOrderId` (`wo_ref`) | text | optional direct link to a work order |
 
 ## 2. `work_orders.csv` — one row per work order
@@ -62,5 +62,5 @@ a model trained only on flagged samples never learns what normal looks like.
 4. **Do machine IDs survive a component swap?** A transplanted engine carries its wear history — you need the component serial.
 5. **Are some samples taken *because* someone suspected a problem?** Gold for labels, but bias the model — flag them if the field exists.
 
-Until `work_orders.csv` arrives, delete nothing: Phases 0–2 run on `sos_samples.csv`
-alone and still produce the weekly watchlist.
+Until detailed work orders arrive, the active application safely remains in
+Alert Management or Condition Monitoring mode and does not invent a probability.
