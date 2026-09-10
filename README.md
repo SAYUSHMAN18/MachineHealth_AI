@@ -7,16 +7,15 @@ This project analyses S.O.S fluid records, optional telemetry and independently 
 ```text
 MachineHealth_AI-main/
 ├── code/       # Dashboard and all active Python model code
-├── data/       # Current and demo input files
+├── data/       # Current input files
 ├── outputs/    # Reports, predictions and trained model
 ├── tests/      # Automated safety/model tests
 ├── config/     # Engineering rule configuration
 ├── docs/       # Data request and validation documents
-├── scripts/    # Windows/Linux launch scripts
-└── archive/    # Preserved legacy phase-based implementation
+└── scripts/    # Windows setup and dashboard launch scripts
 ```
 
-The active application is only `code/app.py` plus `code/predictive_maintenance/`. The archived pipeline is retained for reference and is not imported by the dashboard.
+The active application is `code/app.py`; all calculation and workflow logic is inside `code/predictive_maintenance/`.
 
 ## Start here
 
@@ -29,36 +28,34 @@ cd "C:\Users\ersay\Downloads\MachineHealth_AI-main"
 
 Open `http://localhost:8501`, select a data source, and choose **Run analysis**. Use:
 
-- **Supplied current data** to analyse the provided alert-only export.
-- **Matched prediction demo** to test S.O.S + telemetry + detailed WO prediction end to end. A warning identifies it as synthetic.
-- **Upload your own files** to analyse your exports without changing the source code.
+- **Upload your own files** to analyse new exports without changing the source code.
+- **Current data** appears only when a supported S.O.S history file exists under `data/current`.
 
-The dashboard has five views: Fleet Overview, Action Queue, Asset Analysis, Model Validation and Data Quality.
+For TMS-style exports:
 
-## What the current data can do
+- Upload `SampleHistory_*.xlsx` as **S.O.S sample history file (required)**.
+- Upload `SampleTestDetails_*.xlsx` as **S.O.S test-result detail file (optional)**. Long-format measurements are deduplicated, pivoted and joined by `sampleNum`.
+- Do not upload `SampleDetails_*.xlsx` when its latest sample already exists in Sample History.
+- Do not upload `Telematics_Enums.xlsx` as telemetry; it is a reference dictionary, not time-series machine data.
+- Leave Telemetry and Work-order blank until actual records for those sources are available.
 
-`data/current/SosFluidSample.xlsx` is an alert-only export. All 1,051 rows have `OverallInterp=AR`, so the application runs in **Alert Management** mode and does not calculate failure probabilities.
+For a no-upload local run, store the exports under `data/current` using their normal
+`SampleHistory_*.xlsx` and `SampleTestDetails_*.xlsx` names. Enum/reference files are
+never auto-selected as telemetry.
 
-Verified current-data results:
+The dashboard has three task-based tabs: Fleet Overview, Machine Detail and Data Quality.
 
-- 520 assets and 1,051 laboratory AR records
-- 10 `HighPriority=T` records
-- 929 New and 122 Closed laboratory records
-- 648 records with a linked `WorkOrderId`; 403 without one
-- 364 New records without a WO link
-- 3 P1 Immediate Review records and 6 P1 WO Tracking records
-- 93 P2 Multiple Unlinked records after higher-priority overrides
-- 499 valid sample dates and 552 time-only/invalid dates
-- 952 telemetry rows reduced to 259 snapshots, but no S.O.S/telemetry asset IDs match
-- No structured Fe, Cu, Si, water, viscosity or other numerical laboratory columns
+## Current input state
 
-`WorkOrderId` linkage does not prove inspection, repair, failure confirmation or closure.
+The current folder contains the supplied S.O.S history and long-format test details. The dashboard opens with **Current data** selected. `Telematics_Enums.xlsx` is retained only as a reference dictionary and is not telemetry. No machine time-series telemetry or confirmed work-order outcome file is currently bundled. A linked `WorkOrderId` inside an S.O.S export does not by itself prove inspection, repair, failure confirmation or closure.
 
 ## Operating modes
 
 1. **Alert Management** — prioritises laboratory records and maintenance follow-up. No ML probability.
 2. **Condition Monitoring** — requires at least one asset/component series with three dated numerical laboratory samples.
-3. **Failure Prediction** — requires usable S.O.S predictors (numerical trends and/or varied interpretation text), at least 60 independently labelled samples, explicit confirmed WO outcomes with both classes, and successful leak-resistant chronological validation. Telemetry and per-machine work-order history are optional enrichments, not admission requirements.
+3. **Failure Prediction** — requires usable S.O.S predictors, at least 60 independently labelled samples, at least 15 positive and 15 negative outcomes across five machines, at least 12 distinct dates, explicit confirmed WO outcomes, and successful leak-resistant chronological validation. Telemetry is optional enrichment.
+
+Even before labelled failure prediction is available, the dashboard now derives a separate **forward-looking condition outlook** from dated AR/NAR transitions, repeated abnormal findings, resampling timing and numerical-result coverage. This predicts whether the next laboratory condition is likely to remain abnormal; it is explicitly not presented as a machine-failure probability.
 
 The model never creates labels from S.O.S severity and never flips labels to force two classes.
 
@@ -102,29 +99,24 @@ python -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 $env:PYTHONPATH="$PWD\code"
+$env:PYTHONDONTWRITEBYTECODE="1"
 python -m pytest -q
 python -m streamlit run code\app.py
 ```
 
-The deterministic maintenance summary is local by default. Optional Gemini support requires:
-
-```powershell
-python -m pip install -r requirements-ai.txt
-```
-
-External processing must then be explicitly enabled in the dashboard. Asset identifiers are excluded from the external prompt.
+The workflow is fully local and deterministic. It does not call an external AI service.
 
 ## Command-line analysis
 
 ```powershell
 $env:PYTHONPATH="$PWD\code"
 python -m predictive_maintenance.cli analyze `
-  --sos data\current\SosFluidSample.xlsx `
-  --telemetry data\current\TelematicDataSample.xlsx `
+  --sos data\current\SampleHistory_Asset_120-000432.xlsx `
+  --test-details data\current\SampleTestDetails_ASSET_120-000432.xlsx `
   --output outputs\current
 ```
 
-Expected CLI mode: `Alert Management` with zero matched assets.
+Replace the example paths with the new data files before using the CLI.
 
 ## Important outputs
 
@@ -134,7 +126,7 @@ Expected CLI mode: `Alert Management` with zero matched assets.
 - `scoring_features.csv` — past-only, availability-aware features for every dated S.O.S sample
 - `sample_predictions.csv` — sample decisions, probabilities (when enabled) and the sources used for each prediction
 - `failure_model.joblib` — the selected calibrated model, written only when prediction mode passes
-- `ai_insights.md` — deterministic maintenance triage summary
+- `maintenance_summary.md` — deterministic maintenance triage summary
 - `telemetry_cleaned_scored.csv` — cleaned telemetry; anomaly scoring remains disabled unless prediction readiness passes
 
 ## Methodological protections
@@ -157,16 +149,16 @@ Expected CLI mode: `Alert Management` with zero matched assets.
 - The Random Forest is deliberately bounded (160 trees, depth 12) to reduce training time and overfitting.
 - Invalid dates are flagged separately and never suppress P1 action priority.
 - Closed laboratory status does not claim that maintenance was completed.
-- External LLM processing is off by default.
+- No external LLM processing exists in the runtime workflow.
 
 ## Validation
 
-The included suite covers real-workbook metrics, strict date parsing, independent priority/data-quality logic, multi-label evidence extraction, label leakage prevention, readiness gates, chronological model calibration, UTF-8 CLI output and a Streamlit dashboard smoke test.
+The included suite covers the current workbook schema, strict date parsing, telemetry-schema rejection, independent priority/data-quality logic, sparse measurement trends, label leakage prevention, readiness gates, chronological calibration, UTF-8 CLI output and a Streamlit smoke test.
 
 ```powershell
 python -m pytest -q
 ```
 
-Expected result: `23 passed`.
+The exact passing count is printed by pytest and should have zero failures.
 
 Synthetic or example work orders are schema demonstrations only and must not be mixed into real fleet analysis.

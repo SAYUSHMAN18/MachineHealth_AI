@@ -9,10 +9,14 @@ import pandas as pd
 
 from .data import (
     asset_intersection,
+    enrich_sos_with_test_details,
     load_table,
     prepare_sos,
     prepare_telemetry,
     prepare_work_orders,
+    safe_bool,
+    safe_float,
+    safe_text,
 )
 from .features import (
     RAW_MEASUREMENT_COLUMNS,
@@ -20,7 +24,7 @@ from .features import (
     build_training_table,
     telemetry_asset_summary,
 )
-from .llm import generate_llm_insights
+from .reporting import generate_maintenance_summary
 from .models import score_telemetry_anomalies, train_failure_models
 from .rules import evaluate_sos_rules
 
@@ -85,7 +89,9 @@ def _compute_interp_categories(alerts: pd.DataFrame) -> pd.DataFrame:
     import re as _re
     rows = []
     for _, row in alerts.iterrows():
-        text = str(row.get("original_interpretation", row.get("interpretation_text", "")) or "")
+        text = safe_text(
+            row.get("original_interpretation", row.get("interpretation_text"))
+        )
         sentences = [s.strip() for s in _re.split(r"(?<=[.!?])\s+", text) if s.strip()]
         matched = False
         for cat_name, pattern in _CATEGORY_PATTERNS:
@@ -137,11 +143,11 @@ def _compute_priority_tiers(alerts: pd.DataFrame) -> pd.DataFrame:
     for _, row in alerts.iterrows():
         code = str(row.get("interpretation_code", "")).upper()
         status = str(row.get("status", "New")).upper()
-        hp_raw = str(row.get("high_priority", "") or "").upper()
+        hp_raw = safe_text(row.get("high_priority")).upper()
         hp = hp_raw in ("T", "TRUE", "1", "Y", "YES")
         wo = row.get("wo_id")
         has_wo = pd.notna(wo) and str(wo).strip() not in ("", "<NA>", "nan", "None")
-        is_inv = bool(row.get("is_invalid_date", False))
+        is_inv = safe_bool(row.get("is_invalid_date"))
         asset = row.get("asset_id", "")
         comp = row.get("component", "")
         repeat_count = repeat_map.get((asset, comp), 0)
@@ -217,13 +223,13 @@ def _compute_priority_tiers(alerts: pd.DataFrame) -> pd.DataFrame:
 
 def _extract_sample_risk_drivers(alert_row: pd.Series, top_model_features: list[str] | None = None) -> list[str]:
     drivers: list[str] = []
-    iron = float(alert_row.get("iron_ppm", 0) or 0)
-    copper = float(alert_row.get("copper_ppm", 0) or 0)
-    silicon = float(alert_row.get("silicon_ppm", 0) or 0)
-    water = float(alert_row.get("water_pct", 0) or 0)
-    soot = float(alert_row.get("soot_pct", 0) or 0)
-    viscosity = float(alert_row.get("viscosity_cst", 0) or 0)
-    fuel = float(alert_row.get("fuel_dilution_pct", 0) or 0)
+    iron = safe_float(alert_row.get("iron_ppm"))
+    copper = safe_float(alert_row.get("copper_ppm"))
+    silicon = safe_float(alert_row.get("silicon_ppm"))
+    water = safe_float(alert_row.get("water_pct"))
+    soot = safe_float(alert_row.get("soot_pct"))
+    viscosity = safe_float(alert_row.get("viscosity_cst"))
+    fuel = safe_float(alert_row.get("fuel_dilution_pct"))
     if iron > 80:
         drivers.append(f"Iron Wear Metal Spike ({iron:.0f} ppm)")
     elif iron > 40:
@@ -281,7 +287,7 @@ def _readiness_table(
     text = sos.get("interpretation_text", pd.Series("", index=sos.index)).fillna("").astype(str).str.strip()
     text_rows = int(text.ne("").sum())
     text_variants = int(text.loc[text.ne("")].nunique())
-    text_predictors_ready = text_rows >= 60 and text_variants >= 2
+    text_predictors_ready = text_rows >= 15 and text_variants >= 2
     lab_predictors_ready = numeric_trends_ready or text_predictors_ready
 
     codes = set(sos["interpretation_code"].dropna().astype(str).str.upper().unique())
@@ -299,21 +305,37 @@ def _readiness_table(
         )
     has_explicit_wo_outcomes = explicit_wo_rows >= 20 and explicit_wo_classes >= 2
     matched_sos_rows = int(sos["asset_id"].astype(str).isin(matched_assets).sum())
-    has_telemetry_match = len(matched_assets) >= 5 and matched_sos_rows >= 30
+    has_telemetry_match = len(matched_assets) >= 2 and matched_sos_rows >= 10
     training_rows = 0 if training is None else len(training)
     training_classes = (
         0 if training is None or training.empty
         else int(training["corrective_wo_within_horizon"].nunique())
     )
-    labelled_training_ready = training_rows >= 60 and training_classes >= 2
-    chronological_dates_ready = valid_dates >= 60
+    training_positives = (
+        0 if training is None or training.empty
+        else int(training["corrective_wo_within_horizon"].eq(1).sum())
+    )
+    training_negatives = training_rows - training_positives
+    training_assets = (
+        0 if training is None or training.empty
+        else int(training["asset_id"].nunique(dropna=True))
+    )
+    labelled_training_ready = bool(
+        training_rows >= 60
+        and training_classes >= 2
+        and training_positives >= 15
+        and training_negatives >= 15
+        and training_assets >= 5
+    )
+    distinct_valid_dates = int(sos.loc[valid_date_mask, "sample_date"].nunique())
+    chronological_dates_ready = valid_dates >= 60 and distinct_valid_dates >= 12
 
     criteria = [
         (
             "lab_predictors",
             "Enough usable S.O.S predictors exist",
             lab_predictors_ready,
-            f"{raw_measurements} numerical sample(s); {text_rows} interpretation-text sample(s) with {text_variants} distinct text value(s)",
+            f"{raw_measurements} numerical sample(s); {text_rows} interpretation-text sample(s) with {text_variants} distinct text value(s) — need ≥3 numeric or ≥15 text",
             "Failure Prediction",
         ),
         (
@@ -328,7 +350,7 @@ def _readiness_table(
             "numeric_trends",
             "Numerical laboratory trend history exists",
             numeric_trends_ready,
-            f"{raw_measurements} numerical sample(s); {repeated_numeric_series} asset/component series have ≥3 dated samples",
+            f"{raw_measurements} numerical sample(s); {repeated_numeric_series} asset/component series have ≥3 dated samples — need ≥3 samples",
             "Condition Monitoring + Failure Prediction",
         ),
         (
@@ -349,14 +371,15 @@ def _readiness_table(
             "labelled_training_rows",
             "Enough independently labelled training rows exist",
             labelled_training_ready,
-            f"{training_rows} labelled row(s); {training_classes} target class(es) — need ≥60 rows and both classes",
+            f"{training_rows} labelled row(s); {training_positives} positive, {training_negatives} negative, "
+            f"{training_assets} asset(s) — need ≥60 rows, ≥15/class and ≥5 assets",
             "Failure Prediction",
         ),
         (
             "chronological_dates",
             "Enough valid calendar dates exist for chronological validation",
             chronological_dates_ready,
-            f"{valid_dates} valid dated sample(s) — need ≥60",
+            f"{valid_dates} valid dated sample(s) across {distinct_valid_dates} date(s) — need ≥60 rows and ≥12 dates",
             "Failure Prediction",
         ),
     ]
@@ -577,7 +600,9 @@ def analyze_frames(
         sample_num = str(alert_row.get("sample_number", ""))
         asset_id = str(alert_row.get("asset_id", "Unknown"))
         component = str(alert_row.get("component", "Unknown"))
-        rule_evidence_strength = float(alert_row.get("rule_evidence_strength", 0.25))
+        rule_evidence_strength = safe_float(
+            alert_row.get("rule_evidence_strength"), default=0.25
+        )
         interp_code = str(alert_row.get("interpretation_code", "A")).upper()
         lab_status = str(alert_row.get("lab_status", "Unspecified"))
         priority_tier = str(alert_row.get("priority_tier", alert_row.get("workflow_priority", P3_ACTION)))
@@ -586,9 +611,9 @@ def analyze_frames(
         evidence_level = str(alert_row.get("evidence_level", "Rule match available"))
         score_evidence = scoring_by_source.get(source_row, {})
         data_sources = ["S.O.S."]
-        if float(score_evidence.get("telemetry_available", 0.0) or 0.0) > 0:
+        if safe_float(score_evidence.get("telemetry_available")) > 0:
             data_sources.append("telemetry")
-        if float(score_evidence.get("work_order_history_available", 0.0) or 0.0) > 0:
+        if safe_float(score_evidence.get("work_order_history_available")) > 0:
             data_sources.append("work-order history")
 
         if predictive_risk_enabled:
@@ -624,7 +649,7 @@ def analyze_frames(
             "machine_model": str(alert_row.get("machine_model", "")),
             "sample_date": alert_row.get("sample_date"),
             "sample_date_raw": alert_row.get("sample_date_raw"),
-            "is_invalid_date": bool(alert_row.get("is_invalid_date", False)),
+            "is_invalid_date": safe_bool(alert_row.get("is_invalid_date")),
             "data_quality_status": str(alert_row.get("data_quality_status", "Valid")),
             "data_quality_issue": str(alert_row.get("data_quality_issue", "")),
             "interpretation_code": interp_code,
@@ -707,13 +732,17 @@ def run_analysis(
     output_dir: str | Path = "outputs/current",
     work_orders_path: str | Path | None = None,
     horizon_days: int = 30,
-    api_key: str | None = None,
-    allow_external_ai: bool = False,
+    test_details_path: str | Path | None = None,
 ) -> dict[str, Any]:
     telemetry_raw = load_table(telemetry_path) if telemetry_path else None
     work_orders_raw = load_table(work_orders_path) if work_orders_path else None
+    sos_raw = load_table(sos_path)
+    if test_details_path:
+        sos_raw = enrich_sos_with_test_details(
+            sos_raw, load_table(test_details_path)
+        )
     result = analyze_frames(
-        load_table(sos_path),
+        sos_raw,
         telemetry_raw,
         work_orders_raw,
         horizon_days=horizon_days,
@@ -731,12 +760,10 @@ def run_analysis(
     if result["trained_model"] is not None:
         result["trained_model"].save(output / "failure_model.joblib")
 
-    ai_insights = generate_llm_insights(
-        result, api_key=api_key, allow_external=allow_external_ai
-    )
-    result["ai_insights"] = ai_insights
-    with (output / "ai_insights.md").open("w", encoding="utf-8") as handle:
-        handle.write(ai_insights)
+    maintenance_summary = generate_maintenance_summary(result)
+    result["maintenance_summary"] = maintenance_summary
+    with (output / "maintenance_summary.md").open("w", encoding="utf-8") as handle:
+        handle.write(maintenance_summary)
 
     summary = {
         "operating_mode": result["operating_mode"],

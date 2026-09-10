@@ -202,13 +202,23 @@ def train_failure_models(training: pd.DataFrame) -> tuple[TrainedModel, pd.DataF
         raise ValueError("At least 60 labelled samples are required for chronological calibration and testing.")
     if training[TARGET].nunique() < 2:
         raise ValueError("Training data must contain both positive and negative outcomes.")
+    positives = int(training[TARGET].eq(1).sum())
+    negatives = int(training[TARGET].eq(0).sum())
+    unique_assets = int(
+        training.get("asset_id", pd.Series(dtype="string")).nunique(dropna=True)
+    )
+    if positives < 15 or negatives < 15 or unique_assets < 5:
+        raise ValueError(
+            "Training requires at least 15 positive outcomes, 15 negative outcomes, "
+            "and five distinct assets before model fitting."
+        )
 
     data = training.copy()
     data["sample_date"] = pd.to_datetime(data["sample_date"], errors="coerce")
     data = data.dropna(subset=["sample_date"]).sort_values("sample_date").reset_index(drop=True)
     unique_dates = pd.Index(data["sample_date"].drop_duplicates().sort_values())
-    if len(unique_dates) < 5:
-        raise ValueError("At least five distinct sample dates are required for chronological validation.")
+    if len(unique_dates) < 12:
+        raise ValueError("At least 12 distinct sample dates are required for chronological validation.")
 
     horizon_days = int(pd.to_numeric(data.get("horizon_days", 30), errors="coerce").max())
     horizon = pd.Timedelta(max(horizon_days, 0), unit="D")

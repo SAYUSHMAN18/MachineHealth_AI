@@ -1,94 +1,64 @@
 # Validation Report
 
-## Scope
+## Verified scope
 
-The uploaded project was tested against `data/current/SosFluidSample.xlsx` and `data/current/TelematicDataSample.xlsx`. The bundled `WorkOrderSample.csv` was treated as an example and excluded from the default real-data path.
+The current application was validated against:
 
-## Corrected methodological defects
+- `data/current/SampleHistory_Asset_120-000432.xlsx`
+- `data/current/SampleTestDetails_ASSET_120-000432.xlsx`
 
-- Removed severity-derived and forced training labels.
-- Removed the weighted rule/ML/anomaly score presented as probability.
-- Removed classifier-derived remaining-safe-days output.
-- Separated action priority from date-quality warnings.
-- Required explicit WO outcomes, both target classes and minimum labelled sample counts before prediction; telemetry is optional.
-- Added whole-date chronological train/calibration/test blocks with a prediction-horizon embargo.
-- Selected the candidate on validation data and reserved the final test block for the winner only.
-- Selected usable predictors from the training period only to remove future-availability leakage.
-- Added equal-machine sample weighting so heavily sampled assets do not dominate training.
-- Added a held-out utility gate: probability output is blocked unless the winner beats a no-feature prevalence baseline on average precision and Brier score, with non-zero recall.
-- Excluded right-censored samples whose full future prediction horizon is not observable.
-- Applied supplied observation-end dates per asset rather than using another asset's longer history.
-- Excluded machines outside the WO extract from training instead of treating missing WOs as negative outcomes.
-- Added compact interpretation-text signals for text-heavy S.O.S exports without using lab severity as the target.
-- Added source-availability flags, optional telemetry enrichment and sparse-telemetry suppression.
-- Scored all current dated S.O.S rows rather than only labelled training rows.
-- Made interpretation categorisation multi-label with exact supporting sentences.
-- Made external LLM processing explicit opt-in and identifier-free.
-- Escaped spreadsheet-derived HTML values.
-- Removed automatic loading of the example WO file.
-- Fixed UTF-8 report serialization and current Streamlit API warnings.
+`Telematics_Enums.xlsx` is a reference dictionary, not machine telemetry. The dashboard now excludes it during automatic discovery, and the ingestion layer rejects it when supplied manually because it has no machine asset/timestamp schema.
 
-## Version 3 usability and engineering improvements
+## Implemented safeguards
 
-- Removed the stale sidebar mode that could contradict the current analysis.
-- Made the requested prediction horizon visible at all times and explicitly conditional on readiness gates.
-- Replaced eight technical tabs with five task-based views.
-- Collapsed repeated sample rows into one prioritised machine-component case.
-- Added plain-language conclusions, required actions, timing, WO state and evidence confidence.
-- Separated fleet action counts from raw S.O.S sample counts.
-- Added per-machine laboratory trends, latest deltas, telemetry evidence and auditable raw records.
-- Added a plain-language chronological holdout explanation and confusion matrix.
-- Added issue → impact → required-fix data-quality reporting.
-- Bundled an explicitly labelled matched synthetic demo for end-to-end prediction testing.
+- S.O.S and work-order components use the same canonical aliases before matching.
+- Ambiguous normalized spreadsheet headers fail clearly instead of silently choosing the first column.
+- Invalid telemetry schemas are ignored and reported as a data-quality issue.
+- Failure labels come only from explicit future confirmed corrective work-order outcomes.
+- Right-censored samples are excluded rather than labelled as non-failures.
+- Prediction requires at least 60 labelled rows, 15 positive outcomes, 15 negative outcomes, five assets and 12 distinct dates.
+- Model selection uses chronological train/calibration/test blocks with prediction-horizon embargo.
+- Probability output remains blocked unless the held-out utility gate passes.
+- A historical active finding and the latest laboratory sample are displayed with separate dates/statuses.
+- The 0–100 display is labelled as a heuristic condition index, not a failure probability or remaining-life estimate.
+- Repeated AR deductions now count only the consecutive dated AR sequence.
+- Sparse laboratory trends compare the latest two non-null values for each individual measurement.
+- Work-order event dates are pre-indexed by asset/component to avoid repeated full-table scans.
 
-## Verified real-data result
+## Current real-data result
 
 | Check | Result |
 |---|---:|
 | Operating mode | Alert Management |
-| S.O.S rows | 1,051 |
-| Assets | 520 |
-| Laboratory AR samples | 1,051 |
-| HighPriority=T | 10 |
-| New / Closed | 929 / 122 |
-| WO linked / no link | 648 / 403 |
-| New without WO | 364 |
-| P1 Immediate / P1 Tracking | 3 / 6 |
-| P2 Multiple Unlinked | 93 |
-| P3 Action Required | 268 |
-| Valid / invalid dates | 499 / 552 |
-| Telemetry rows raw / cleaned | 952 / 259 |
-| Matched assets | 0 |
+| S.O.S rows | 5 |
+| Assets | 1 |
+| Valid / invalid dates | 5 / 0 |
+| Laboratory AR samples | 2 |
+| Machine telemetry rows | 0 |
+| Work-order outcome rows | 0 |
+| Operational cases | 1 |
+| Highest case | P2 repeated unresolved finding |
+| Condition trajectory | Persistent abnormal |
 | Failure probabilities generated | 0 |
 
-## Commands executed
+Recommended action from the application: review the repeated P2 case within three days and confirm the laboratory-requested resampling interval.
+
+## Verification executed
 
 ```text
-PYTHONPATH=code python -m pytest -q
-Result: 23 passed
+python -m pytest -q
+Result: 31 passed
 
-python -m compileall -q code tests
-Result: passed with no errors
-
-python -m predictive_maintenance.cli analyze --sos data/current/SosFluidSample.xlsx --telemetry data/current/TelematicDataSample.xlsx --output <temporary-output>
-Result: Alert Management; UTF-8 output files written successfully
+Current Excel end-to-end analysis
+Result: Alert Management; 5 samples; 1 case; no telemetry; no failure probability
 
 Streamlit AppTest
-Result: all five pages passed with no application exceptions in both supplied-data and matched-demo modes (10 page/mode combinations)
+Result: current-data dashboard completed without an application exception
 
-No-telemetry end-to-end check
-Result: S.O.S + independently labelled WOs activated Failure Prediction, scored all 360/360 synthetic samples and saved failure_model.joblib. This validates execution, not real-world accuracy.
-
-Matched-demo utility-gate check
-Result: Logistic Regression passed; average-precision lift 0.644 and Brier skill 0.990 on the untouched chronological test block. This remains a synthetic execution check, not evidence of field accuracy.
+Synthetic independently-labelled pipeline check
+Result: Failure Prediction activated and produced a non-empty validation summary
 ```
 
-## Remaining data limitations
+## Remaining data limitation
 
-- All S.O.S records are already AR; there is no normal comparison population.
-- No structured numerical laboratory analytes are present.
-- The telemetry asset does not match any S.O.S asset.
-- WorkOrderId linkage is not a detailed or confirmed maintenance outcome.
-- 552 sample dates have no usable calendar date.
-
-The supplied current dataset therefore remains in Alert Management mode. The application now contains an availability-aware predictive model, but real-world predictive validity requires a materially larger explicit work-order outcome history.
+The software workflow is ready, but this five-row extract cannot validate real-world failure prediction. Production probability requires substantially more independently confirmed work-order outcomes, including both failures and non-failures, across multiple machines and dates. Until those gates pass, the application correctly provides deterministic laboratory triage and condition outlook only.

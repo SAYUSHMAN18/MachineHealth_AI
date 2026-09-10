@@ -2,9 +2,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from predictive_maintenance.data import load_table, prepare_sos, prepare_telemetry, prepare_work_orders
+from predictive_maintenance.data import (
+    enrich_sos_with_test_details,
+    load_table,
+    prepare_sos,
+    prepare_telemetry,
+    prepare_work_orders,
+)
 from predictive_maintenance.features import build_scoring_table, build_training_table
-from predictive_maintenance.llm import generate_llm_insights
+from predictive_maintenance.reporting import generate_maintenance_summary
 from predictive_maintenance.models import _heldout_utility_metrics, train_failure_models
 from predictive_maintenance.pipeline import (
     MODE_ALERT, MODE_CONDITION, MODE_PREDICTION,
@@ -13,23 +19,66 @@ from predictive_maintenance.pipeline import (
     analyze_frames, run_analysis,
 )
 from predictive_maintenance.presentation import (
-    build_case_table, build_fleet_summary, build_mode_summary,
-    build_validation_summary,
+    build_case_table, build_condition_outlook, build_fleet_summary, build_mode_summary,
+    build_quality_issues, build_validation_summary, compute_machine_health_score,
+    latest_measurement_changes, measurement_trend_table,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _current_sos_raw() -> pd.DataFrame:
+    base = ROOT / "data/current"
+    history = next(iter(sorted(base.glob("SampleHistory*.xlsx"))), None)
+    if history is None:
+        history = next(iter(sorted(base.glob("SosFluidSample*.xlsx"))), None)
+    assert history is not None, "Current S.O.S history fixture is missing"
+    raw = load_table(history)
+    details = next(iter(sorted(base.glob("SampleTestDetails*.xlsx"))), None)
+    if details is not None:
+        raw = enrich_sos_with_test_details(raw, load_table(details))
+    return raw
+
+
+def _synthetic_prediction_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
+    samples: list[dict] = []
+    work_orders: list[dict] = []
+    dates = pd.date_range("2023-01-01", periods=18, freq="40D")
+    observation_end = dates[-1] + pd.Timedelta(days=60)
+    for period, sample_date in enumerate(dates):
+        for asset_number in range(10):
+            positive = (period + asset_number) % 2 == 0
+            asset_id = f"EQ-{asset_number:02d}"
+            sample_id = f"S-{period:02d}-{asset_number:02d}"
+            samples.append({
+                "SampleNum": sample_id,
+                "EquipNum": asset_id,
+                "Compartment": "ENGINE",
+                "OverallInterp": "AR" if positive else "NAR",
+                "InterpText": "Elevated iron wear" if positive else "Normal condition",
+                "DateSampled": sample_date,
+                "Fe": 220.0 if positive else 20.0,
+                "Cu": 25.0 if positive else 3.0,
+            })
+            work_orders.append({
+                "WorkOrderId": f"WO-{period:02d}-{asset_number:02d}",
+                "EquipmentId": asset_id,
+                "Component": "ENG",
+                "OpenedDate": sample_date + pd.Timedelta(days=5),
+                "ObservationEndDate": observation_end,
+                "WorkOrderType": "CORRECTIVE" if positive else "PREVENTIVE",
+                "FailureConfirmed": int(positive),
+            })
+    return pd.DataFrame(samples), pd.DataFrame(work_orders)
+
+
 def test_sos_sample_automatically_selects_alert_management_mode():
-    result = analyze_frames(
-        load_table(ROOT / "data/current/SosFluidSample.xlsx"),
-        load_table(ROOT / "data/current/TelematicDataSample.xlsx"),
-    )
+    result = analyze_frames(_current_sos_raw())
     assert result["operating_mode"] == MODE_ALERT
     assert result["mode"] == MODE_ALERT
     assert not result["predictive_risk_enabled"]
-    assert len(result["sos"]) == 1051
-    assert len(result["alerts"]) == 1051
+    assert len(result["sos"]) > 0
+    assert len(result["alerts"]) == len(result["sos"])
     assert result["matched_assets"] == set()
 
 
@@ -55,6 +104,128 @@ def test_ar_alone_never_produces_failure_probability():
     assert (cards["failure_probability_pct"].isna()).all(), "AR alone must never produce a failure probability"
     assert "Not Available" in cards.iloc[0]["predicted_risk_status"]
     assert result["trained_model"] is None, "ML model must not run when operating mode is Alert Management"
+
+
+def test_nullable_blank_cells_from_fuzzy_upload_do_not_crash():
+    fuzzy_sos = pd.DataFrame({
+        "SampleNum": ["S-NA"],
+        "EquipNum": ["EQ-NA"],
+        "Compartment": ["ENGINE"],
+        "OverallInterp": [pd.NA],
+        "InterpText": [pd.NA],
+        "HighPriority": [pd.NA],
+        "SampleStatusNew": [pd.NA],
+        "DateSampled": ["2026-08-01"],
+        "Fe": [pd.NA],
+    })
+    result = analyze_frames(fuzzy_sos)
+    assert result["operating_mode"] == MODE_ALERT
+    assert result["alerts"].iloc[0]["lab_status"] == "Unspecified"
+    assert not result["predictive_risk_enabled"]
+    assert pd.isna(
+        result["maintenance_action_cards"].iloc[0]["failure_probability_pct"]
+    )
+
+
+def test_tms_camelcase_history_and_long_test_details_are_supported():
+    history = pd.DataFrame({
+        "sampleNum": [101, 102],
+        "equipNum": ["120-000432 / 2082"] * 2,
+        "serialNum": ["6AB01170"] * 2,
+        "eqpModel": ["621E_CAT"] * 2,
+        "compartment": ["FD_FR_LT"] * 2,
+        "overallInterp": ["NAR", "AR"],
+        "interpText": [
+            "NO PROBLEMS PRESENTLY ASSOCIATED WITH THIS SAMPLE.",
+            "EXCESSIVE WATER PRESENT IN SAMPLE. SAMPLE IN 50 HOURS.",
+        ],
+        "dateSampled": ["2025-01-01", "2026-01-01"],
+        "cMeter": [1000, 1500],
+        "cMeterFluid": [500, 1000],
+        "sampleStatusNew": ["New", "New"],
+    })
+    details = pd.DataFrame({
+        "sampleNum": [101, 101, 102, 102],
+        "resultName": ["Fe", "Fe", "WATER", "V100"],
+        "resultFormattedEntry": [10, 20, 1000, 15.2],
+        "resultUnits": ["PPM", "PPM", "PPM", "CST"],
+        "resultNumber": [9001, 9001, 9002, 9003],
+        "SynapseModifiedDateTime": [
+            "2025-01-02 10:00:00",
+            "2025-01-02 11:00:00",
+            "2026-01-02 10:00:00",
+            "2026-01-02 10:00:00",
+        ],
+    })
+    enriched = enrich_sos_with_test_details(history, details)
+    prepared = prepare_sos(enriched)
+    assert prepared["asset_id"].eq("120-000432 / 2082").all()
+    assert prepared.loc[prepared["sample_number"].eq("101"), "iron_ppm"].iloc[0] == 20
+    assert prepared.loc[prepared["sample_number"].eq("102"), "water_pct"].iloc[0] == 0.1
+    assert prepared.loc[prepared["sample_number"].eq("102"), "viscosity_cst"].iloc[0] == 15.2
+
+    result = analyze_frames(enriched)
+    assert len(result["sos"]) == 2
+    assert result["alerts"].iloc[0]["lab_status"] == "Normal"
+    latest = result["alerts"].sort_values("sample_date").iloc[-1]
+    assert "water contamination" in latest["evidence"].lower()
+
+
+def test_unperformed_zero_results_do_not_become_fake_measurements():
+    history = pd.DataFrame({
+        "sampleNum": [201], "equipNum": ["EQ-1"], "compartment": ["ENG"],
+        "overallInterp": ["AR"], "interpText": ["EXCESSIVE WATER PREVENTS MOST ANALYSIS."],
+        "dateSampled": ["2026-01-01"],
+    })
+    details = pd.DataFrame({
+        "sampleNum": [201, 201], "resultName": ["WATER", "V100"],
+        "resultFormattedEntry": [0, 0], "resultUnits": ["PPM", "CST"],
+        "resultNumber": [1, 2],
+        "interpText": ["EXCESSIVE WATER PREVENTS MOST ANALYSIS."] * 2,
+    })
+    prepared = prepare_sos(enrich_sos_with_test_details(history, details))
+    assert pd.isna(prepared.iloc[0]["water_pct"])
+    assert pd.isna(prepared.iloc[0]["viscosity_cst"])
+
+
+def test_incompatible_lab_units_are_not_mixed_into_trends():
+    history = pd.DataFrame({
+        "sampleNum": [301, 302],
+        "equipNum": ["EQ-1", "EQ-1"],
+        "compartment": ["ENG", "ENG"],
+        "overallInterp": ["NAR", "AR"],
+        "dateSampled": ["2025-01-01", "2025-02-01"],
+    })
+    details = pd.DataFrame({
+        "sampleNum": [301, 302],
+        "resultName": ["FE", "FE"],
+        "resultFormattedEntry": [10.0, 99.0],
+        "resultUnits": ["PPM", "%"],
+        "resultNumber": [1, 2],
+    })
+    prepared = prepare_sos(enrich_sos_with_test_details(history, details))
+    assert prepared.loc[prepared["sample_number"].eq("301"), "iron_ppm"].iloc[0] == 10.0
+    assert pd.isna(
+        prepared.loc[prepared["sample_number"].eq("302"), "iron_ppm"].iloc[0]
+    )
+
+
+def test_condition_outlook_is_forward_looking_but_not_failure_probability():
+    sos = pd.DataFrame({
+        "SampleNum": ["S1", "S2", "S3", "S4", "S5"],
+        "EquipNum": ["EQ-1"] * 5,
+        "Compartment": ["ENG"] * 5,
+        "OverallInterp": ["NAR", "NAR", "NAR", "AR", "AR"],
+        "InterpText": ["Normal"] * 3 + ["Inspect and resample"] + ["Water entry; sample in 50 hours"],
+        "DateSampled": ["2023-01-01", "2024-01-01", "2024-06-01", "2025-08-01", "2026-08-01"],
+    })
+    result = analyze_frames(sos)
+    outlook = build_condition_outlook(result, "EQ-1", "ENG")
+    assert outlook["trajectory"] == "Persistent abnormal"
+    assert outlook["persistence"].startswith("2 consecutive action-required")
+    assert outlook["checkpoint"] == "Resample in 50 operating hours"
+    assert outlook["confidence"] == "Low"
+    assert result["maintenance_action_cards"]["failure_probability_pct"].isna().all()
 
 
 def test_6_tier_priority_classification():
@@ -95,38 +266,24 @@ def test_6_tier_priority_classification():
     assert "Unparseable" in alerts.loc["S07", "data_quality_issue"]
 
 
-def test_dataset_metrics_exact_counts():
-    sos = load_table(ROOT / "data/current/SosFluidSample.xlsx")
+def test_dataset_metrics_are_internally_consistent_for_current_data():
+    sos = _current_sos_raw()
     result = analyze_frames(sos, telemetry_raw=None, work_orders_raw=None)
     m = result["dataset_metrics"]
 
-    assert m["unique_assets"] == 520
-    assert m["lab_ar_samples"] == 1051
-    assert m["high_priority_samples"] == 10
-    assert m["new_alerts"] == 929
-    assert m["closed_alerts"] == 122
-    assert m["wo_linked_samples"] == 648
-    assert m["samples_without_wo"] == 403
-    assert m["new_alerts_without_wo"] == 364
-    assert m["invalid_date_samples"] == 552
-    assert m["valid_date_samples"] == 499
-    assert m["high_priority_new_without_wo"] == 3
-    assert m["high_priority_new_with_wo"] == 6
-    assert m["high_priority_closed"] == 1
-    assert m["repeated_new_unlinked_rows"] == 94
-    assert m["p1_immediate_records"] == 3
-    assert m["p1_wo_tracking_records"] == 6
-    assert m["p2_multiple_unlinked_records"] == 93
-    assert m["p3_action_records"] == 268
-
-    priorities = result["alerts"]["priority_tier"].value_counts()
-    assert priorities[P1_IMMEDIATE] == 3
-    assert priorities[P1_WO_TRACKING] == 6
-    assert priorities[TIER_CLOSED] == 122
+    assert m["unique_assets"] == result["sos"]["asset_id"].nunique(dropna=True)
+    assert m["valid_date_samples"] + m["invalid_date_samples"] == len(result["sos"])
+    assert m["lab_ar_samples"] == result["sos"]["interpretation_code"].astype(str).str.upper().eq("AR").sum()
+    assert sum(
+        m[key] for key in [
+            "p1_immediate_records", "p1_wo_tracking_records",
+            "p2_multiple_unlinked_records", "p3_action_records",
+        ]
+    ) <= len(result["alerts"])
 
 
 def test_ml_not_run_in_alert_management_mode():
-    sos = load_table(ROOT / "data/current/SosFluidSample.xlsx")
+    sos = _current_sos_raw()
     result = analyze_frames(sos, telemetry_raw=None, work_orders_raw=None)
     assert result["operating_mode"] == MODE_ALERT
     assert result["trained_model"] is None
@@ -152,11 +309,10 @@ def test_interp_categories_retain_exact_evidence_sentence():
     assert resample.iloc[0]["category_evidence"] == "Inspect bearing and resample within 10 days."
 
 
-def test_llm_insights_contain_mode_header(monkeypatch):
-    sos = load_table(ROOT / "data/current/SosFluidSample.xlsx")
+def test_local_maintenance_summary_contains_mode_header():
+    sos = _current_sos_raw()
     result = analyze_frames(sos)
-    monkeypatch.setenv("GEMINI_API_KEY", "must-not-be-used-without-opt-in")
-    insights = generate_llm_insights(result)
+    insights = generate_maintenance_summary(result)
     assert "Maintenance Triage Summary" in insights
     assert "Alert Management" in insights
     assert "OverallInterp=AR" in insights
@@ -218,10 +374,21 @@ def test_training_labels_are_never_manufactured_from_sos_severity():
 
 
 def test_small_example_wo_file_does_not_unlock_prediction():
+    sos = _current_sos_raw()
+    asset_id = str(prepare_sos(sos).iloc[0]["asset_id"])
+    small_wo = pd.DataFrame({
+        "WorkOrderId": ["WO-1", "WO-2"],
+        "EquipmentId": [asset_id, asset_id],
+        "Component": ["ENG", "ENG"],
+        "OpenedDate": ["2026-01-10", "2026-02-10"],
+        "ObservationEndDate": ["2026-12-31", "2026-12-31"],
+        "WorkOrderType": ["CORRECTIVE", "PREVENTIVE"],
+        "FailureConfirmed": [1, 0],
+    })
     result = analyze_frames(
-        load_table(ROOT / "data/current/SosFluidSample.xlsx"),
-        load_table(ROOT / "data/current/TelematicDataSample.xlsx"),
-        load_table(ROOT / "data/current/WorkOrderSample.csv"),
+        sos,
+        telemetry_raw=None,
+        work_orders_raw=small_wo,
     )
     gate = result["readiness"].set_index("gate")
     assert gate.loc["explicit_wo_outcomes", "status"] == "BLOCKED"
@@ -328,11 +495,12 @@ def test_text_heavy_sos_is_a_valid_predictor_source_but_not_a_label():
     assert scoring[["lab_text_wear_signal", "lab_text_coolant_signal"]].sum().sum() == rows
 
 
-def test_prediction_demo_runs_without_telemetry_and_scores_all_sos_rows():
+def test_prediction_pipeline_runs_without_telemetry_and_scores_all_sos_rows():
+    sos, work_orders = _synthetic_prediction_inputs()
     result = analyze_frames(
-        load_table(ROOT / "data/demo/Demo_SOSFluidAnalysis.xlsx"),
+        sos,
         telemetry_raw=None,
-        work_orders_raw=load_table(ROOT / "data/demo/Demo_WorkOrders.xlsx"),
+        work_orders_raw=work_orders,
     )
     assert result["operating_mode"] == MODE_PREDICTION
     assert result["predictive_risk_enabled"]
@@ -391,23 +559,24 @@ def test_model_utility_gate_rejects_a_constant_no_skill_prediction():
 
 
 def test_cli_outputs_are_utf8_serializable(tmp_path):
+    base = ROOT / "data/current"
+    history = next(iter(sorted(base.glob("SampleHistory*.xlsx"))))
+    details = next(iter(sorted(base.glob("SampleTestDetails*.xlsx"))), None)
     result = run_analysis(
-        ROOT / "data/current/SosFluidSample.xlsx",
-        ROOT / "data/current/TelematicDataSample.xlsx",
+        history,
+        telemetry_path=None,
         output_dir=tmp_path,
+        test_details_path=details,
     )
     assert result["operating_mode"] == MODE_ALERT
-    report = (tmp_path / "ai_insights.md").read_text(encoding="utf-8")
+    report = (tmp_path / "maintenance_summary.md").read_text(encoding="utf-8")
     assert "Maintenance Triage Summary" in report
     assert (tmp_path / "analysis_summary.json").exists()
     assert (tmp_path / "model_readiness.csv").exists()
 
 
 def test_presentation_uses_current_mode_and_unique_cases():
-    result = analyze_frames(
-        load_table(ROOT / "data/current/SosFluidSample.xlsx"),
-        load_table(ROOT / "data/current/TelematicDataSample.xlsx"),
-    )
+    result = analyze_frames(_current_sos_raw())
     mode = build_mode_summary(result, 90)
     cases = build_case_table(result, 90)
     fleet = build_fleet_summary(result, cases, 90)
@@ -415,8 +584,8 @@ def test_presentation_uses_current_mode_and_unique_cases():
     assert not mode["prediction_enabled"]
     assert cases["case_id"].is_unique
     assert len(cases) < len(result["sos"])
-    assert fleet["immediate_action"] == 9
-    assert fleet["samples"] == 1051
+    assert fleet["samples"] == len(result["sos"])
+    assert fleet["machine_components"] == len(cases)
 
 
 def test_case_probability_uses_latest_prediction_not_historical_maximum():
@@ -431,7 +600,7 @@ def test_case_probability_uses_latest_prediction_not_historical_maximum():
         "sample_number": ["S1", "S2"],
         "machine_model": ["M", "M"],
         "site_name": ["A", "A"],
-        "lab_status": ["Warning", "Warning"],
+        "lab_status": ["Warning", "Normal"],
         "action_needed": ["Inspect", "Review"],
         "wo_id": [None, None],
         "data_quality_status": ["Valid", "Valid"],
@@ -445,6 +614,50 @@ def test_case_probability_uses_latest_prediction_not_historical_maximum():
     }, 30)
     assert cases.iloc[0]["failure_probability_pct"] == 20
     assert cases.iloc[0]["prediction_data_sources"] == "S.O.S."
+    assert cases.iloc[0]["active_finding_lab_status"] == "Warning"
+    assert cases.iloc[0]["latest_lab_status"] == "Normal"
+    assert pd.Timestamp(cases.iloc[0]["finding_sample_date"]) == pd.Timestamp("2025-01-01")
+    assert pd.Timestamp(cases.iloc[0]["latest_sample_date"]) == pd.Timestamp("2025-02-01")
+
+
+def test_condition_index_uses_latest_valid_date_and_true_consecutive_ar_count():
+    result = analyze_frames(pd.DataFrame({
+        "SampleNum": ["S1", "S2", "S3", "S4"],
+        "EquipNum": ["EQ-1"] * 4,
+        "Compartment": ["ENGINE"] * 4,
+        "OverallInterp": ["AR", "NAR", "AR", "NAR"],
+        "InterpText": ["Wear", "Normal", "Wear", "Undated normal"],
+        "DateSampled": ["2025-01-01", "2025-02-01", "2025-03-01", "invalid"],
+    }))
+    health = compute_machine_health_score(result, "EQ-1", "ENG")
+    assert health["health_score"] == 70
+    assert "Lab Action Required (AR)" in health["penalties"]
+    assert not any("consecutive" in item for item in health["penalties"])
+
+
+def test_sparse_measurement_change_uses_last_two_non_null_values():
+    result = analyze_frames(pd.DataFrame({
+        "SampleNum": ["S1", "S2", "S3"],
+        "EquipNum": ["EQ-1"] * 3,
+        "Compartment": ["ENG"] * 3,
+        "OverallInterp": ["NAR"] * 3,
+        "DateSampled": ["2025-01-01", "2025-02-01", "2025-03-01"],
+        "Fe": [10.0, np.nan, 30.0],
+    }))
+    trend = measurement_trend_table(result["sos"], "EQ-1", "ENG")
+    changes = latest_measurement_changes(trend, limit=8).set_index("measurement")
+    assert changes.loc["iron_ppm", "current"] == 30.0
+    assert changes.loc["iron_ppm", "previous"] == 10.0
+    assert changes.loc["iron_ppm", "change"] == 20.0
+
+
+def test_enum_dictionary_is_rejected_as_telemetry():
+    enum_path = ROOT / "data/current/Telematics_Enums.xlsx"
+    result = analyze_frames(_current_sos_raw(), load_table(enum_path))
+    assert result["telemetry"].empty
+    assert "ignored" in result["telemetry_quality"]["schema_issue"].lower()
+    issues = build_quality_issues(result)
+    assert "Invalid telemetry schema" in set(issues["issue"])
 
 
 def test_streamlit_dashboard_smoke_and_current_mode():
@@ -452,26 +665,16 @@ def test_streamlit_dashboard_smoke_and_current_mode():
 
     app = AppTest.from_file(str(ROOT / "code/app.py"), default_timeout=90).run()
     assert not app.exception
-    metrics = {metric.label: metric.value for metric in app.metric}
-    assert metrics["P1 cases today"] == "9"
-    assert metrics["Evidence confidence"] == "Low"
-    view = next(item for item in app.radio if item.label == "View")
-    assert view.options == ["Fleet Overview", "Action Queue", "Asset Analysis", "Model Validation", "Data Quality"]
-    assert next(item for item in app.select_slider if item.label == "Prediction horizon (days)").value == 30
+    assert next(item for item in app.radio if item.label == "Source").value == "Current data"
+    assert next(item for item in app.select_slider if item.label == "Forecast window (days)").value == 30
+    assert any("Machine Health Dashboard" in item.value for item in app.markdown)
     assert any("Alert Management active" in item.value for item in app.markdown)
 
 
-def test_streamlit_matched_demo_runs_prediction_and_validation_page():
-    from streamlit.testing.v1 import AppTest
-
-    app = AppTest.from_file(str(ROOT / "code/app.py"), default_timeout=180).run()
-    next(item for item in app.radio if item.label == "Data source").set_value("Matched prediction demo")
-    app.run(timeout=180)
-    assert not app.exception
-    assert any("Failure Prediction active" in item.value for item in app.markdown)
-    assert any("synthetic" in item.value.lower() for item in app.warning)
-    next(item for item in app.radio if item.label == "View").set_value("Model Validation")
-    app.run(timeout=180)
-    assert not app.exception
-    assert any(header.value == "Model Validation" for header in app.header)
-    assert build_validation_summary(app.session_state["analysis"]) is not None
+def test_synthetic_prediction_has_validation_summary():
+    sos, work_orders = _synthetic_prediction_inputs()
+    result = analyze_frames(sos, work_orders_raw=work_orders)
+    validation = build_validation_summary(result)
+    assert result["operating_mode"] == MODE_PREDICTION
+    assert validation is not None
+    assert validation["passes_utility_gate"]

@@ -1,5 +1,0 @@
-WorkOrderId,EquipmentId,Component,OpenedDate,ClosedDate,WorkOrderType,ProblemDescription,ActionTaken,FailureConfirmed
-WO-2025-001,120-000053,ENGINE,2025-12-28,2025-12-29,CORRECTIVE,High iron wear metal in oil sample,Replaced engine bearings and oil filter,1
-WO-2025-002,120-000053,ENGINE,2026-01-10,2026-01-12,BREAKDOWN,Engine oil pressure drop and severe wear,Overhauled engine crankshaft and flushed system,1
-WO-2025-003,120-000378,HYDRAULIC,2025-12-22,2025-12-23,CORRECTIVE,Silicon contamination and seal degradation,Replaced hydraulic seals and fluid,1
-WO-2025-004,120-000378,HYDRAULIC,2026-01-05,2026-01-06,PREVENTIVE,Scheduled oil change and filter replacement,Changed oil and filter,0

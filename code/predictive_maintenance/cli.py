@@ -13,8 +13,7 @@ def analyze_command(args: argparse.Namespace) -> None:
         args.output,
         work_orders_path=args.work_orders,
         horizon_days=args.horizon,
-        api_key=args.api_key,
-        allow_external_ai=args.allow_external_ai,
+        test_details_path=args.test_details,
     )
     print(f"Mode: {result['mode']}")
     print(f"S.O.S samples: {len(result['sos'])}")
@@ -28,18 +27,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Heavy-machinery predictive-maintenance POC")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    analyze = subparsers.add_parser("analyze", help="Analyze S.O.S and telemetry files")
+    analyze = subparsers.add_parser("analyze", help="Run the deterministic maintenance workflow")
     analyze.add_argument("--sos", required=True)
+    analyze.add_argument("--test-details", help="Optional long-format S.O.S test-result file")
     analyze.add_argument("--telemetry", help="Path to telemetry Excel/CSV file (Optional)")
     analyze.add_argument("--work-orders", help="Path to work orders Excel/CSV file (Optional)")
     analyze.add_argument("--output", default="outputs/current")
     analyze.add_argument("--horizon", type=int, default=30)
-    analyze.add_argument("--api-key", help="Gemini API Key for LLM Insights generation")
-    analyze.add_argument(
-        "--allow-external-ai",
-        action="store_true",
-        help="Explicitly allow an aggregated, identifier-free summary prompt to be sent to Gemini",
-    )
     analyze.set_defaults(func=analyze_command)
     return parser
 

@@ -6,7 +6,13 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-call ".venv\Scripts\activate.bat"
+".venv\Scripts\python.exe" -c "import sys" >nul 2>nul
+if errorlevel 1 (
+  echo The existing .venv is stale or broken. Run scripts\setup_and_run.bat to recreate it.
+  pause
+  exit /b 1
+)
 set "PYTHONPATH=%CD%\code"
-python -m streamlit run code\app.py
+set "PYTHONDONTWRITEBYTECODE=1"
+".venv\Scripts\python.exe" -m streamlit run code\app.py
 endlocal

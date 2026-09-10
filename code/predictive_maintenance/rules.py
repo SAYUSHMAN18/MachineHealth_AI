@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from .data import safe_bool, safe_text
+
 
 DEFAULT_RULES_PATH = Path(__file__).resolve().parents[2] / "config" / "rules.yaml"
 
@@ -35,8 +37,8 @@ def evaluate_sos_rules(sos: pd.DataFrame, rules_path: str | Path | None = None) 
     rows: list[dict] = []
 
     for _, sample in sos.iterrows():
-        text = str(sample.get("interpretation_text", "") or "")
-        code = str(sample.get("interpretation_code", "") or "").upper()
+        text = safe_text(sample.get("interpretation_text"))
+        code = safe_text(sample.get("interpretation_code")).upper()
         base_score = severity_codes.get(code, 0.25)
         evidence: list[str] = []
         recommendations: list[str] = []
@@ -79,7 +81,7 @@ def evaluate_sos_rules(sos: pd.DataFrame, rules_path: str | Path | None = None) 
         # Laboratory Status Display Name
         if code == "AR":
             lab_status = "Laboratory Action Required"
-        elif code in ["A", "NORMAL"]:
+        elif code in ["A", "NAR", "NORMAL"]:
             lab_status = "Normal"
         elif code in ["B", "YELLOW", "WATCH"]:
             lab_status = "Warning"
@@ -99,7 +101,7 @@ def evaluate_sos_rules(sos: pd.DataFrame, rules_path: str | Path | None = None) 
         wo_id = sample.get("wo_id")
         has_wo = pd.notna(wo_id) and str(wo_id).strip() not in ["", "<NA>", "nan", "None"]
 
-        is_invalid_date = bool(sample.get("is_invalid_date", False)) or pd.isna(sample_date) or (
+        is_invalid_date = safe_bool(sample.get("is_invalid_date")) or pd.isna(sample_date) or (
             isinstance(sample_date, pd.Timestamp) and (sample_date.year < 1950 or sample_date.year > 2035)
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import IO, Any
 
 import numpy as np
@@ -10,25 +11,51 @@ import pandas as pd
 TabularSource = str | Path | IO[bytes] | IO[str]
 
 
-def resolve_file_path(source: TabularSource) -> TabularSource:
-    if isinstance(source, (str, Path)):
-        p = Path(source)
-        if not p.exists():
-            candidates = ["SOSFluidAnalysisSample.xlsx", "SosFluidSample.xlsx"]
-            for cand in candidates:
-                alt = p.parent / cand
-                if alt.exists():
-                    return alt
-            if p.name == "WorkOrderSample.csv":
-                alt = p.parent.parent / "demo" / "Demo_WorkOrders.xlsx"
-                if alt.exists():
-                    return alt
-    return source
+def _is_scalar_missing(value: Any) -> bool:
+    """Return True for None/pandas/numpy missing scalars without ambiguous truth tests."""
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(missing, (bool, np.bool_)) and bool(missing)
+
+
+def safe_text(value: Any, default: str = "") -> str:
+    """Convert a spreadsheet scalar to text while treating blank/NA as empty."""
+    return default if _is_scalar_missing(value) else str(value)
+
+
+def safe_bool(value: Any, default: bool = False) -> bool:
+    """Convert common spreadsheet boolean values without evaluating pd.NA."""
+    if _is_scalar_missing(value):
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().upper()
+        if normalized in {"TRUE", "T", "YES", "Y", "1"}:
+            return True
+        if normalized in {"FALSE", "F", "NO", "N", "0", ""}:
+            return False
+    try:
+        return bool(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    """Convert a spreadsheet scalar to a finite float with a safe fallback."""
+    if _is_scalar_missing(value):
+        return default
+    try:
+        converted = float(value)
+    except (TypeError, ValueError):
+        return default
+    return converted if np.isfinite(converted) else default
 
 
 def load_table(source: TabularSource) -> pd.DataFrame:
     """Load an Excel or CSV table from a path or uploaded file object."""
-    source = resolve_file_path(source)
     name = str(getattr(source, "name", source)).lower()
     if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(source)
@@ -45,15 +72,241 @@ def _clean_identifier(series: pd.Series) -> pd.Series:
     )
 
 
-def _first_existing(df: pd.DataFrame, candidates: list[str], default: Any = pd.NA) -> pd.Series:
+COMPONENT_ALIASES = {
+    "ENGINE": "ENG",
+    "ENG": "ENG",
+    "HYDRAULIC": "HYD",
+    "HYDRAULICS": "HYD",
+    "HYD": "HYD",
+    "TRANSMISSION": "TRANS",
+    "TRANS": "TRANS",
+    "TR": "TRANS",
+}
+
+
+def _clean_component(series: pd.Series) -> pd.Series:
+    """Normalize common component aliases before S.O.S/WO matching."""
+    cleaned = (
+        _clean_identifier(series)
+        .str.upper()
+        .str.replace(r"[^A-Z0-9]+", "_", regex=True)
+        .str.strip("_")
+    )
+    return cleaned.replace(COMPONENT_ALIASES)
+
+
+def _column_key(value: Any) -> str:
+    """Normalize spreadsheet headers for case/punctuation-insensitive matching."""
+    return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
+
+
+def _resolve_column_name(df: pd.DataFrame, candidates: list[str]) -> Any | None:
     for column in candidates:
         if column in df.columns:
-            return df[column]
+            return column
+    normalized_columns: dict[str, list[Any]] = {}
+    for column in df.columns:
+        normalized_columns.setdefault(_column_key(column), []).append(column)
+    for candidate in candidates:
+        matched = normalized_columns.get(_column_key(candidate), [])
+        if len(matched) > 1:
+            raise ValueError(
+                f"Ambiguous spreadsheet headers {matched!r}; rename one column before analysis."
+            )
+        if matched:
+            return matched[0]
+    return None
+
+
+def _first_existing(df: pd.DataFrame, candidates: list[str], default: Any = pd.NA) -> pd.Series:
+    column = _resolve_column_name(df, candidates)
+    if column is not None:
+        return df[column]
     return pd.Series(default, index=df.index)
 
 
 def _numeric_alias(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
     return pd.to_numeric(_first_existing(df, candidates, np.nan), errors="coerce")
+
+
+def enrich_sos_with_test_details(
+    sos_raw: pd.DataFrame,
+    test_details_raw: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Join long-format laboratory results onto one-row-per-sample S.O.S history.
+
+    TMS exports repeat one result across several synchronization snapshots. We
+    keep the latest snapshot for each result identifier, pivot supported tests,
+    and fill (never overwrite) measurements already present in the history file.
+    """
+    if test_details_raw is None or test_details_raw.empty:
+        return sos_raw.copy()
+
+    history_sample_column = _resolve_column_name(
+        sos_raw, ["SampleNum", "SampleNumber", "sample_id", "Id"]
+    )
+    detail_sample_column = _resolve_column_name(
+        test_details_raw, ["SampleNum", "SampleNumber", "sample_id", "Id"]
+    )
+    result_name_column = _resolve_column_name(
+        test_details_raw, ["resultName", "ResultName", "resultAliasName"]
+    )
+    result_value_column = _resolve_column_name(
+        test_details_raw,
+        ["resultFormattedEntry", "ResultFormattedEntry", "ResultValue", "Value"],
+    )
+    if any(
+        column is None
+        for column in [history_sample_column, detail_sample_column, result_name_column, result_value_column]
+    ):
+        raise ValueError(
+            "S.O.S test-detail enrichment requires sampleNum, resultName and "
+            "resultFormattedEntry columns, plus sampleNum in the history file."
+        )
+
+    details = test_details_raw.copy()
+    details["_sample_key"] = _clean_identifier(details[detail_sample_column])
+    details["_result_name"] = (
+        details[result_name_column].astype("string").str.strip().str.upper()
+    )
+    details["_numeric_value"] = pd.to_numeric(
+        details[result_value_column], errors="coerce"
+    )
+    interpretation_column = _resolve_column_name(
+        details, ["interpText", "InterpretationText", "Comment", "Comments"]
+    )
+    details["_analysis_prevented"] = (
+        details[interpretation_column]
+        .astype("string")
+        .str.contains(
+            r"prevent(?:s|ed)?\s+(?:most\s+)?analysis|"
+            r"unable\s+to\s+(?:complete|perform|analyse|analyze)|"
+            r"analysis\s+(?:was\s+)?not\s+(?:completed|performed)",
+            case=False,
+            regex=True,
+            na=False,
+        )
+        if interpretation_column is not None
+        else False
+    )
+    units_column = _resolve_column_name(details, ["resultUnits", "Units", "Unit"])
+    details["_units"] = (
+        details[units_column].astype("string").str.strip().str.upper()
+        if units_column is not None
+        else ""
+    )
+    modified_column = _resolve_column_name(
+        details,
+        ["SynapseModifiedDateTime", "resultChangedOn", "ModifiedOn"],
+    )
+    details["_modified"] = (
+        pd.to_datetime(details[modified_column], errors="coerce")
+        if modified_column is not None
+        else pd.NaT
+    )
+    result_number_column = _resolve_column_name(
+        details, ["resultNumber", "ResultNumber", "ResultId"]
+    )
+    details = details.sort_values("_modified", na_position="first")
+    duplicate_key = ["_sample_key", "_result_name"]
+    if result_number_column is not None:
+        details["_result_id"] = _clean_identifier(details[result_number_column])
+        duplicate_key = ["_sample_key", "_result_id"]
+    details = details.drop_duplicates(duplicate_key, keep="last")
+
+    # Some TMS exports populate unperformed infrared-panel results with a
+    # numeric zero when contamination prevented the analysis. A zero in this
+    # situation is a system placeholder, not a measured concentration. Keep
+    # the laboratory text/rule evidence, but exclude those placeholders from
+    # numerical trend calculations.
+    prevented_placeholder = (
+        details["_analysis_prevented"] & details["_numeric_value"].eq(0)
+    )
+    details.loc[prevented_placeholder, "_numeric_value"] = np.nan
+
+    result_mapping = {
+        "FE": "Fe",
+        "CU": "Cu",
+        "AL": "Al",
+        "CR": "Cr",
+        "PB": "Pb",
+        "SI": "Si",
+        "V100": "Viscosity",
+        "OXI": "Oxidation",
+        "ST": "Soot",
+        "IBN": "TBN",
+        "FUEL": "FuelDilution",
+        "FUEL DILUTION": "FuelDilution",
+        "WATER": "WaterPct",
+        "TOTAL WATER": "WaterPct",
+    }
+    details["_output_column"] = details["_result_name"].map(result_mapping)
+
+    # Do not silently mix incompatible units in one trend. Blank units remain
+    # accepted for legacy exports, while known fields with explicit units must
+    # use an equivalent representation.
+    allowed_units = {
+        "Fe": {"", "PPM", "MG/KG"},
+        "Cu": {"", "PPM", "MG/KG"},
+        "Al": {"", "PPM", "MG/KG"},
+        "Cr": {"", "PPM", "MG/KG"},
+        "Pb": {"", "PPM", "MG/KG"},
+        "Si": {"", "PPM", "MG/KG"},
+        "Viscosity": {"", "CST", "MM2/S", "MM²/S"},
+        "WaterPct": {"", "PPM", "MG/KG", "%", "PCT", "PERCENT"},
+        "FuelDilution": {"", "%", "PCT", "PERCENT"},
+        "Soot": {"", "%", "PCT", "PERCENT"},
+    }
+    explicit_unit_supported = details.apply(
+        lambda row: (
+            pd.isna(row["_output_column"])
+            or row["_output_column"] not in allowed_units
+            or row["_units"] in allowed_units[row["_output_column"]]
+        ),
+        axis=1,
+    )
+    details.loc[~explicit_unit_supported, "_numeric_value"] = np.nan
+    supported = details.dropna(
+        subset=["_sample_key", "_output_column", "_numeric_value"]
+    ).copy()
+    if supported.empty:
+        return sos_raw.copy()
+
+    # The test-detail export reports water in ppm; the model stores a fraction
+    # expressed as percent, so 10,000 ppm equals 1 percent.
+    water_ppm = supported["_output_column"].eq("WaterPct") & supported["_units"].isin(
+        ["PPM", "MG/KG"]
+    )
+    supported.loc[water_ppm, "_numeric_value"] = (
+        supported.loc[water_ppm, "_numeric_value"] / 10_000.0
+    )
+    # Prefer the explicit WATER result when both WATER and TOTAL WATER exist.
+    supported["_measurement_priority"] = supported["_result_name"].map(
+        {"TOTAL WATER": 1, "WATER": 2}
+    ).fillna(1)
+    supported = supported.sort_values(["_modified", "_measurement_priority"])
+    supported = supported.drop_duplicates(
+        ["_sample_key", "_output_column"], keep="last"
+    )
+    wide = supported.pivot(
+        index="_sample_key", columns="_output_column", values="_numeric_value"
+    )
+
+    enriched = sos_raw.copy()
+    sample_keys = _clean_identifier(enriched[history_sample_column])
+    for output_column in result_mapping.values():
+        if output_column not in wide.columns:
+            continue
+        mapped_values = sample_keys.map(wide[output_column])
+        existing_column = _resolve_column_name(enriched, [output_column])
+        if existing_column is None:
+            enriched[output_column] = mapped_values
+        else:
+            existing_values = pd.to_numeric(enriched[existing_column], errors="coerce")
+            enriched[existing_column] = existing_values.where(
+                existing_values.notna(), mapped_values
+            )
+    return enriched
 
 
 def _parse_calendar_dates(series: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -87,10 +340,8 @@ def prepare_sos(df: pd.DataFrame) -> pd.DataFrame:
     out["machine_model"] = _clean_identifier(
         _first_existing(out, ["EqpModel", "EquipmentModel", "Model"])
     )
-    out["component"] = (
-        _clean_identifier(_first_existing(out, ["Compartment", "Component", "component"]))
-        .str.upper()
-        .str.replace(r"\s+", "_", regex=True)
+    out["component"] = _clean_component(
+        _first_existing(out, ["Compartment", "Component", "component"])
     )
     sample_date_raw = _first_existing(out, ["DateSampled", "SampleDate", "sample_date"])
     out["sample_date_raw"] = sample_date_raw.astype("string")
@@ -159,25 +410,44 @@ def prepare_telemetry(df: pd.DataFrame | None) -> tuple[pd.DataFrame, dict[str, 
             "date_start": pd.NaT,
             "date_end": pd.NaT,
             "stale_or_constant_fields": [],
+            "schema_issue": None,
         }
         return empty_df, quality
     raw = df.copy()
-    raw["asset_id"] = _clean_identifier(
-        _first_existing(raw, ["TMSAssetID", "EquipmentHeader_EquipmentID", "EquipmentId", "AssetId"])
+    asset_column = _resolve_column_name(
+        raw,
+        [
+            "TMSAssetID", "EquipmentHeader_EquipmentID", "EquipmentId",
+            "EquipmentID", "EquipNum", "AssetId",
+        ],
     )
+    event_column = _resolve_column_name(
+        raw,
+        [
+            "Location_Datetime", "CumulativeOperatingHours_Datetime", "Timestamp",
+            "EventDateTime", "DateTime", "EventTime", "ReadingDate", "event_time",
+        ],
+    )
+    if asset_column is None or event_column is None:
+        empty, quality = prepare_telemetry(None)
+        quality["rows_before_deduplication"] = int(len(raw))
+        missing: list[str] = []
+        if asset_column is None:
+            missing.append("asset identifier")
+        if event_column is None:
+            missing.append("event timestamp")
+        quality["schema_issue"] = (
+            "Telemetry file was ignored because it has no " + " and ".join(missing) + "."
+        )
+        return empty, quality
+    raw["asset_id"] = _clean_identifier(raw[asset_column])
     raw["serial_number"] = _clean_identifier(
         _first_existing(raw, ["TMSSerialNum", "EquipmentHeader_SerialNumber", "SerialNumber"])
     )
     raw["machine_model"] = _clean_identifier(
         _first_existing(raw, ["EquipmentHeader_Model", "EquipmentModel", "Model"])
     )
-    raw["event_time"] = pd.to_datetime(
-        _first_existing(
-            raw,
-            ["Location_Datetime", "CumulativeOperatingHours_Datetime", "Timestamp", "event_time"],
-        ),
-        errors="coerce",
-    )
+    raw["event_time"] = pd.to_datetime(raw[event_column], errors="coerce")
     raw["modified_time"] = pd.to_datetime(
         _first_existing(raw, ["SynapseModifiedDateTime", "ModifiedOn"], pd.NaT), errors="coerce"
     )
@@ -226,6 +496,7 @@ def prepare_telemetry(df: pd.DataFrame | None) -> tuple[pd.DataFrame, dict[str, 
         "date_start": out["event_time"].min(),
         "date_end": out["event_time"].max(),
         "stale_or_constant_fields": stale_fields,
+        "schema_issue": None,
     }
     return out, quality
 
@@ -236,10 +507,8 @@ def prepare_work_orders(df: pd.DataFrame) -> pd.DataFrame:
     out["asset_id"] = _clean_identifier(
         _first_existing(out, ["EquipmentId", "EquipNum", "AssetId", "EquipmentID"])
     )
-    out["component"] = (
-        _clean_identifier(_first_existing(out, ["Component", "Compartment", "component"]))
-        .str.upper()
-        .str.replace(r"\s+", "_", regex=True)
+    out["component"] = _clean_component(
+        _first_existing(out, ["Component", "Compartment", "component"])
     )
     out["wo_id"] = _clean_identifier(
         _first_existing(out, ["WorkOrderId", "WO_ID", "wo_id", "Id"])

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from .data import safe_float, safe_text
 from .features import RAW_MEASUREMENT_COLUMNS, add_sos_trends
 from .pipeline import (
     MODE_ALERT,
@@ -104,12 +106,12 @@ FEATURE_LABELS = {
 
 
 def component_label(value: object) -> str:
-    raw = str(value or "Unknown").strip().upper()
+    raw = safe_text(value, default="Unknown").strip().upper() or "UNKNOWN"
     return COMPONENT_LABELS.get(raw, raw.replace("_", " ").title())
 
 
 def feature_label(value: object) -> str:
-    raw = str(value or "").split("__")[-1]
+    raw = safe_text(value).split("__")[-1]
     return FEATURE_LABELS.get(raw, raw.replace("_", " ").title())
 
 
@@ -194,6 +196,254 @@ def _case_confidence(result: dict[str, Any], asset_id: str, component: str) -> t
     return label, "; ".join(reasons)
 
 
+def build_condition_outlook(
+    result: dict[str, Any], asset_id: str, component: str
+) -> dict[str, Any]:
+    """Create a transparent forward condition outlook without claiming failure probability.
+
+    This deliberately forecasts the *next laboratory condition*, not a machine
+    failure. It uses dated status transitions, persistence and measurement
+    coverage, so the conclusion is visibly different from copying the latest
+    AR/NAR cell.
+    """
+    alerts = result.get("alerts", pd.DataFrame())
+    sos = result.get("sos", pd.DataFrame())
+    empty = {
+        "trajectory": "Insufficient history",
+        "persistence": "No dated sequence",
+        "outlook": "A forward condition outlook cannot be formed yet.",
+        "checkpoint": "Next scheduled sample",
+        "confidence": "Low",
+        "basis": "No usable dated laboratory sequence",
+    }
+    if not isinstance(alerts, pd.DataFrame) or alerts.empty:
+        return empty
+
+    history = alerts[
+        alerts["asset_id"].astype(str).eq(str(asset_id))
+        & alerts["component"].astype(str).eq(str(component))
+        & ~alerts["is_invalid_date"].fillna(True)
+    ].sort_values("sample_date")
+    if history.empty:
+        return empty
+
+    status_text = history["lab_status"].astype("string").str.lower()
+    severity = pd.Series(np.nan, index=history.index, dtype=float)
+    severity.loc[status_text.str.contains("normal", na=False)] = 0.0
+    severity.loc[status_text.str.contains("warning|monitor", regex=True, na=False)] = 1.0
+    severity.loc[
+        status_text.str.contains("action required|severe|critical", regex=True, na=False)
+    ] = 2.0
+    valid_severity = severity.dropna()
+    if valid_severity.empty:
+        return {
+            **empty,
+            "basis": f"{len(history)} dated sample(s), but no recognised laboratory status sequence",
+        }
+
+    latest_score = float(valid_severity.iloc[-1])
+    prior_score = float(valid_severity.iloc[-2]) if len(valid_severity) >= 2 else np.nan
+    consecutive = 1
+    for value in reversed(valid_severity.iloc[:-1].tolist()):
+        if float(value) != latest_score:
+            break
+        consecutive += 1
+
+    latest_date = pd.to_datetime(history["sample_date"].iloc[-1], errors="coerce")
+    run_start_index = valid_severity.index[-consecutive]
+    run_start = pd.to_datetime(history.loc[run_start_index, "sample_date"], errors="coerce")
+    run_days = int((latest_date - run_start).days) if pd.notna(latest_date) and pd.notna(run_start) else 0
+
+    if latest_score >= 2 and consecutive >= 2:
+        trajectory = "Persistent abnormal"
+        outlook = (
+            "Elevated chance that the next laboratory sample remains action-required "
+            "unless the identified cause is removed and the repair is confirmed by resampling."
+        )
+    elif pd.notna(prior_score) and latest_score > prior_score:
+        trajectory = "Worsening"
+        outlook = (
+            "The latest status deteriorated; the next sample has an elevated chance of "
+            "remaining abnormal until corrective action is verified."
+        )
+    elif pd.notna(prior_score) and latest_score < prior_score:
+        trajectory = "Improving"
+        outlook = "The latest status improved, but one confirmation sample is still needed."
+    elif latest_score >= 2:
+        trajectory = "Abnormal — new"
+        outlook = "A repeat sample is needed to determine whether the abnormal condition persists."
+    elif latest_score == 1:
+        trajectory = "Monitor"
+        outlook = "Continue monitoring; no failure probability is justified from this sequence."
+    else:
+        trajectory = "Stable normal"
+        outlook = "No deterioration is evident in the available laboratory-status sequence."
+
+    latest_label = "action-required" if latest_score >= 2 else "warning" if latest_score == 1 else "normal"
+    persistence = f"{consecutive} consecutive {latest_label} sample(s)"
+    if consecutive >= 2 and run_days > 0:
+        persistence += f" across {run_days} days"
+
+    sample_history = sos[
+        sos["asset_id"].astype(str).eq(str(asset_id))
+        & sos["component"].astype(str).eq(str(component))
+        & ~sos["is_invalid_date"].fillna(True)
+    ] if isinstance(sos, pd.DataFrame) and not sos.empty else pd.DataFrame()
+    numeric_rows = int(sample_history[RAW_MEASUREMENT_COLUMNS].notna().any(axis=1).sum()) if not sample_history.empty else 0
+    abnormal_count = int(valid_severity.ge(2).sum())
+
+    latest = history.iloc[-1]
+    timing_text = " ".join([
+        safe_text(latest.get("recommended_action")),
+        safe_text(latest.get("original_interpretation")),
+    ])
+    timing_match = re.search(r"\b(\d{1,4})\s*(?:operating[- ]?)?hours?\b", timing_text, flags=re.I)
+    checkpoint = f"Resample in {timing_match.group(1)} operating hours" if timing_match else "Next scheduled sample"
+
+    telemetry = result.get("telemetry", pd.DataFrame())
+    work_orders = result.get("work_orders")
+    has_telemetry = isinstance(telemetry, pd.DataFrame) and not telemetry.empty and telemetry["asset_id"].astype(str).eq(str(asset_id)).any()
+    has_wo = isinstance(work_orders, pd.DataFrame) and not work_orders.empty and work_orders["asset_id"].astype(str).eq(str(asset_id)).any()
+    confidence = (
+        "High" if len(valid_severity) >= 12 and numeric_rows >= 6 and has_wo
+        else "Medium" if len(valid_severity) >= 6 and numeric_rows >= 3
+        else "Low"
+    )
+    basis = (
+        f"{len(valid_severity)} dated statuses; {abnormal_count} action-required; "
+        f"{numeric_rows} sample(s) with measured numerical results; "
+        f"telemetry {'available' if has_telemetry else 'not available'}; "
+        f"WO outcomes {'available' if has_wo else 'not available'}"
+    )
+    return {
+        "trajectory": trajectory,
+        "persistence": persistence,
+        "outlook": outlook,
+        "checkpoint": checkpoint,
+        "confidence": confidence,
+        "basis": basis,
+    }
+
+
+def compute_machine_health_score(
+    result: dict[str, Any], asset_id: str, component: str
+) -> dict[str, Any]:
+    """Compute a transparent heuristic condition index, never a failure probability."""
+    sos = result.get("sos", pd.DataFrame())
+    comp_sos = sos[
+        sos["asset_id"].astype(str).eq(str(asset_id))
+        & sos["component"].astype(str).eq(str(component))
+    ] if isinstance(sos, pd.DataFrame) and not sos.empty else pd.DataFrame()
+
+    dated_sos = (
+        comp_sos.loc[
+            ~comp_sos["is_invalid_date"].fillna(True)
+            & pd.to_datetime(comp_sos["sample_date"], errors="coerce").notna()
+        ].sort_values("sample_date")
+        if not comp_sos.empty
+        else pd.DataFrame()
+    )
+    # Undated rows cannot safely be treated as the newest condition. They still
+    # remain visible in the action queue and data-quality report.
+    latest_sos = dated_sos.iloc[-1] if not dated_sos.empty else (
+        comp_sos.sort_values("source_row").iloc[-1] if not comp_sos.empty else {}
+    )
+    lab_code = str(latest_sos.get("interpretation_code", "")).upper()
+    interp_text = str(latest_sos.get("interpretation_text", "")).lower()
+
+    score = 100.0
+    penalties: list[str] = []
+    fingerprints: list[str] = []
+
+    # 1. Lab status penalty
+    if lab_code == "AR":
+        ordered_codes = dated_sos["interpretation_code"].astype(str).str.upper().tolist()
+        consecutive_ar = 0
+        for code in reversed(ordered_codes):
+            if code != "AR":
+                break
+            consecutive_ar += 1
+        consecutive_ar = max(consecutive_ar, 1)
+        if consecutive_ar >= 2:
+            score -= 45
+            penalties.append(f"Repeated lab Action Required ({consecutive_ar}x consecutive)")
+        else:
+            score -= 30
+            penalties.append("Lab Action Required (AR)")
+    elif any(k in lab_code for k in ["WARN", "MONITOR", "B", "C"]):
+        score -= 15
+        penalties.append("Lab Monitor / Warning status")
+
+    # 2. Contaminant inspection
+    water_val = latest_sos.get("water_pct", np.nan)
+    has_water = (
+        (pd.notna(water_val) and safe_float(water_val) > 0.02)
+        or "water present" in interp_text
+        or "excessive water" in interp_text
+    )
+    if has_water:
+        score -= 25
+        penalties.append("Severe water contamination")
+        fingerprints.append("Seal/Plug Moisture Ingress")
+
+    if any(k in interp_text for k in ["coolant", "glycol", "antifreeze"]):
+        score -= 25
+        penalties.append("Coolant / Glycol contamination")
+        fingerprints.append("Cooler / Internal Leak")
+
+    if any(k in interp_text for k in ["fuel dilution", "fuel in oil"]):
+        score -= 20
+        penalties.append("Fuel dilution")
+        fingerprints.append("Fuel Injector Dilution")
+
+    # 3. Wear metals inspection
+    fe = safe_float(latest_sos.get("iron_ppm", np.nan), np.nan)
+    cu = safe_float(latest_sos.get("copper_ppm", np.nan), np.nan)
+    al = safe_float(latest_sos.get("aluminium_ppm", np.nan), np.nan)
+    si = safe_float(latest_sos.get("silicon_ppm", np.nan), np.nan)
+
+    if np.isfinite(fe) and fe > 150 and np.isfinite(cu) and cu > 15:
+        score -= 20
+        penalties.append(f"Elevated gear & bushing wear (Fe {fe:.0f}, Cu {cu:.0f} ppm)")
+        fingerprints.append("Gear Mesh & Bushing Breakdown")
+    elif np.isfinite(fe) and fe > 150:
+        score -= 15
+        penalties.append(f"Elevated Iron ({fe:.0f} ppm)")
+        fingerprints.append("Mechanical Gear Wear")
+
+    if np.isfinite(si) and si > 25 and np.isfinite(al) and al > 15:
+        score -= 15
+        penalties.append(f"Abrasive dirt ingress (Si {si:.0f}, Al {al:.0f} ppm)")
+        fingerprints.append("Abrasive Dust Ingress via Breather")
+
+    # 4. Fluid condition
+    if any(k in interp_text for k in ["viscosity", "oxidation", "degraded"]):
+        score -= 10
+        penalties.append("Fluid degradation / thermal stress")
+
+    final_score = int(max(5, min(100, round(score))))
+    if final_score >= 85:
+        status_label = "Optimal"
+        status_color = "#16a34a"
+    elif final_score >= 65:
+        status_label = "Monitor"
+        status_color = "#d97706"
+    else:
+        status_label = "Degraded"
+        status_color = "#dc2626"
+
+    fingerprint_text = " + ".join(fingerprints) if fingerprints else "Normal Mechanical Baseline"
+
+    return {
+        "health_score": final_score,
+        "health_status": status_label,
+        "health_color": status_color,
+        "fingerprint": fingerprint_text,
+        "penalties": penalties,
+        "method": "Heuristic condition index; not a probability or remaining-life estimate",
+    }
+
+
 def build_case_table(result: dict[str, Any], horizon_days: int) -> pd.DataFrame:
     """Collapse sample rows into one operational case per asset and component."""
     cards = result.get("maintenance_action_cards", pd.DataFrame())
@@ -215,7 +465,9 @@ def build_case_table(result: dict[str, Any], horizon_days: int) -> pd.DataFrame:
             ascending=[True, False, False],
         ).iloc[0]
         dated = group.loc[group["_sample_date"].notna()].sort_values("_sample_date")
-        latest_date = dated["_sample_date"].max() if not dated.empty else pd.NaT
+        latest_row = dated.iloc[-1] if not dated.empty else group.sort_values("_row_rank").iloc[-1]
+        latest_date = latest_row.get("_sample_date", pd.NaT)
+        finding_date = selected.get("_sample_date", pd.NaT)
         probability_rows = group.assign(
             _probability=pd.to_numeric(group.get("failure_probability_pct"), errors="coerce")
         ).dropna(subset=["_probability"])
@@ -234,6 +486,8 @@ def build_case_table(result: dict[str, Any], horizon_days: int) -> pd.DataFrame:
         wo_id = selected.get("wo_id")
         has_wo = _has_value(wo_id)
         confidence, confidence_reason = _case_confidence(result, str(asset_id), str(component))
+        condition_outlook = build_condition_outlook(result, str(asset_id), str(component))
+        health_info = compute_machine_health_score(result, str(asset_id), str(component))
         priority = str(selected.get("priority_tier", P3_ACTION))
         due = "Today" if priority in {P1_IMMEDIATE, P1_WO_TRACKING} else "Within 3 days" if priority in {P2_REPEATED, P3_ACTION} else "Track" if priority == TIER_IN_PROGRESS else "Closed"
         rows.append({
@@ -247,7 +501,10 @@ def build_case_table(result: dict[str, Any], horizon_days: int) -> pd.DataFrame:
             "machine_model": str(selected.get("machine_model", "")),
             "site_name": str(selected.get("site_name", "Unknown")),
             "latest_sample_date": latest_date,
-            "lab_status": str(selected.get("lab_status", "Unspecified")),
+            "finding_sample_date": finding_date,
+            "lab_status": str(latest_row.get("lab_status", "Unspecified")),
+            "latest_lab_status": str(latest_row.get("lab_status", "Unspecified")),
+            "active_finding_lab_status": str(selected.get("lab_status", "Unspecified")),
             "main_issue": main_issue,
             "failure_probability_pct": probability,
             "probability_display": f"{probability:.0f}% / {int(horizon_days)} days" if np.isfinite(probability) else "Not available",
@@ -260,6 +517,18 @@ def build_case_table(result: dict[str, Any], horizon_days: int) -> pd.DataFrame:
             "total_sample_count": int(len(group)),
             "data_confidence": confidence,
             "confidence_reason": confidence_reason,
+            "condition_trajectory": condition_outlook["trajectory"],
+            "condition_persistence": condition_outlook["persistence"],
+            "next_condition_outlook": condition_outlook["outlook"],
+            "next_checkpoint": condition_outlook["checkpoint"],
+            "outlook_confidence": condition_outlook["confidence"],
+            "outlook_basis": condition_outlook["basis"],
+            "health_score": health_info["health_score"],
+            "health_status": health_info["health_status"],
+            "health_color": health_info["health_color"],
+            "failure_fingerprint": health_info["fingerprint"],
+            "health_penalties": health_info["penalties"],
+            "health_method": health_info["method"],
             "data_quality_status": str(selected.get("data_quality_status", "Valid")),
             "data_quality_issue": str(selected.get("data_quality_issue", "")),
             "sample_number": str(selected.get("sample_number", "")),
@@ -287,6 +556,8 @@ def build_fleet_summary(result: dict[str, Any], cases: pd.DataFrame, horizon_day
     if isinstance(work_orders, pd.DataFrame) and not work_orders.empty:
         open_corrective = int((work_orders["is_corrective"] & work_orders["closed_date"].isna()).sum())
 
+    avg_fleet_health = int(round(float(active["health_score"].mean()))) if not active.empty and "health_score" in active.columns else 100
+
     confidence_order = {"High": 3, "Medium": 2, "Low": 1}
     confidence = "Not available"
     if not cases.empty:
@@ -297,10 +568,17 @@ def build_fleet_summary(result: dict[str, Any], cases: pd.DataFrame, horizon_day
     samples = int(len(sos)) if isinstance(sos, pd.DataFrame) else 0
     assets = int(sos["asset_id"].nunique(dropna=True)) if samples else 0
     cases_count = int(len(cases))
+    p2_count = int(active["priority_code"].eq(P2_REPEATED).sum()) if not active.empty else 0
+    p3_count = int(active["priority_code"].eq(P3_ACTION).sum()) if not active.empty else 0
     if immediate:
         recommendation = f"Review {immediate} P1 machine-component case(s) today; {wo_linked} active case(s) have a linked WO and {no_wo_p1} P1 case(s) need WO verification or creation."
+    elif p2_count or p3_count:
+        recommendation = (
+            f"No P1 case was generated. Review {p2_count} repeated P2 case(s) and "
+            f"{p3_count} P3 engineering-review case(s) within 3 days."
+        )
     else:
-        recommendation = "No P1 case was generated. Review monitoring cases and continue scheduled sampling."
+        recommendation = "No P1/P2/P3 case was generated. Continue scheduled sampling and monitor open work orders."
     conclusion = (
         f"{assets} machines, {cases_count} machine-components and {samples} S.O.S samples were analysed. "
         f"{immediate} machine-component case(s) require immediate review. Current active cases include "
@@ -321,6 +599,7 @@ def build_fleet_summary(result: dict[str, Any], cases: pd.DataFrame, horizon_day
         "wo_linked_active": wo_linked,
         "open_corrective_wos": open_corrective,
         "analysis_confidence": confidence,
+        "avg_fleet_health": avg_fleet_health,
         "conclusion": conclusion,
         "recommendation": recommendation,
     }
@@ -381,6 +660,16 @@ def build_quality_issues(result: dict[str, Any]) -> pd.DataFrame:
     matched = result.get("matched_assets", set()) or set()
     issues: list[dict[str, Any]] = []
 
+    telemetry_schema_issue = safe_text(telemetry_quality.get("schema_issue")).strip()
+    if telemetry_schema_issue:
+        issues.append({
+            "severity": "Warning",
+            "issue": "Invalid telemetry schema",
+            "count": int(safe_float(telemetry_quality.get("rows_before_deduplication"))),
+            "impact": telemetry_schema_issue,
+            "fix": "Provide machine time-series telemetry with an asset identifier and event timestamp; do not upload enum/reference dictionaries.",
+        })
+
     invalid = int(sos["is_invalid_date"].fillna(True).sum()) if isinstance(sos, pd.DataFrame) and not sos.empty else 0
     if invalid:
         issues.append({"severity": "Blocker", "issue": "Invalid or time-only sample dates", "count": invalid, "impact": "Date-dependent trends and response-time analysis exclude these rows.", "fix": "Supply a complete calendar date for DateSampled."})
@@ -396,7 +685,7 @@ def build_quality_issues(result: dict[str, Any]) -> pd.DataFrame:
         unmatched_rows = int((~sos["asset_id"].astype(str).isin(matched)).sum())
         if unmatched_rows:
             issues.append({"severity": "Information", "issue": "S.O.S rows without matched telemetry", "count": unmatched_rows, "impact": "These records use the other available predictors; telemetry is optional.", "fix": "If telemetry exists for these machines, align EquipNum and TMSAssetID or provide an approved mapping table."})
-    duplicates = int(telemetry_quality.get("duplicate_asset_timestamp_rows", 0) or 0)
+    duplicates = int(safe_float(telemetry_quality.get("duplicate_asset_timestamp_rows")))
     if duplicates:
         issues.append({"severity": "Information", "issue": "Duplicate telemetry asset/timestamp rows", "count": duplicates, "impact": "Duplicates were resolved by retaining the most recently modified record.", "fix": "Review source-system duplicate generation if the count grows."})
     review_rows = int(alerts.get("data_quality_status", pd.Series(dtype="string")).astype(str).eq("Review required").sum()) if isinstance(alerts, pd.DataFrame) else 0
@@ -408,29 +697,36 @@ def build_quality_issues(result: dict[str, Any]) -> pd.DataFrame:
 def measurement_trend_table(sos: pd.DataFrame, asset_id: str, component: str) -> pd.DataFrame:
     if sos.empty:
         return pd.DataFrame()
-    enriched = add_sos_trends(sos)
-    subset = enriched[
-        enriched["asset_id"].astype(str).eq(str(asset_id))
-        & enriched["component"].astype(str).eq(str(component))
-        & ~enriched["is_invalid_date"].fillna(True)
-    ].sort_values("sample_date")
-    return subset
+    subset = sos[
+        sos["asset_id"].astype(str).eq(str(asset_id))
+        & sos["component"].astype(str).eq(str(component))
+        & ~sos["is_invalid_date"].fillna(True)
+    ].copy()
+    if subset.empty:
+        return subset
+    # Calculate trends only for the selected series instead of rescanning the fleet.
+    return add_sos_trends(subset).sort_values("sample_date")
 
 
 def latest_measurement_changes(trend: pd.DataFrame, limit: int = 4) -> pd.DataFrame:
     if trend.empty:
         return pd.DataFrame()
-    latest = trend.iloc[-1]
-    previous = trend.iloc[-2] if len(trend) >= 2 else None
     rows: list[dict[str, Any]] = []
     for measurement in RAW_MEASUREMENT_COLUMNS:
-        current = pd.to_numeric(pd.Series([latest.get(measurement)]), errors="coerce").iloc[0]
-        if pd.isna(current):
+        values = trend[["sample_date", measurement, f"{measurement}_rate_100h"]].copy()
+        values[measurement] = pd.to_numeric(values[measurement], errors="coerce")
+        values = values.dropna(subset=[measurement]).sort_values("sample_date")
+        if values.empty:
             continue
-        prev = pd.to_numeric(pd.Series([previous.get(measurement) if previous is not None else np.nan]), errors="coerce").iloc[0]
+        current_row = values.iloc[-1]
+        previous_row = values.iloc[-2] if len(values) >= 2 else None
+        current = float(current_row[measurement])
+        prev = float(previous_row[measurement]) if previous_row is not None else np.nan
         delta = current - prev if pd.notna(prev) else np.nan
         pct = (delta / abs(prev) * 100) if pd.notna(delta) and prev != 0 else np.nan
-        rate = pd.to_numeric(pd.Series([latest.get(f"{measurement}_rate_100h")]), errors="coerce").iloc[0]
+        rate = pd.to_numeric(
+            pd.Series([current_row.get(f"{measurement}_rate_100h")]), errors="coerce"
+        ).iloc[0]
         rows.append({
             "measurement": measurement,
             "measurement_name": MEASUREMENT_LABELS.get(measurement, measurement),

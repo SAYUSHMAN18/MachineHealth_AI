@@ -2,6 +2,7 @@ version: 1
 severity_codes:
   AR: 0.40
   A: 0.20
+  NAR: 0.10
   WATCH: 0.55
   NORMAL: 0.10
 
@@ -27,6 +28,8 @@ rules:
       - "coolant.*(entry|leak|contamin)"
       - "glycol"
       - "water.*(high|elevated|contamin)"
+      - "excessive water"
+      - "water (present|entry)"
     evidence: "Possible coolant or water contamination"
     recommendation: "Confirm the result with the laboratory and inspect the cooling and lubrication systems; a qualified engineer should decide whether operating restrictions are required."
 

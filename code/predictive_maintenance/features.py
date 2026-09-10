@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .data import safe_text
+
 
 RAW_MEASUREMENT_COLUMNS = [
     "iron_ppm",
@@ -153,6 +155,27 @@ def build_training_table(
     if wo_df.empty:
         return pd.DataFrame()
 
+    component_scoped = wo_df["component"].notna().any()
+    confirmed = wo_df.loc[
+        wo_df["is_corrective"] & wo_df["confirmed_failure"] & wo_df["opened_date"].notna()
+    ].copy()
+    failure_dates_by_key: dict[tuple[str, str | None], pd.DatetimeIndex] = {}
+    if not confirmed.empty:
+        confirmed["_asset_key"] = confirmed["asset_id"].astype(str)
+        for asset_key, group in confirmed.groupby("_asset_key", dropna=False):
+            failure_dates_by_key[(str(asset_key), None)] = pd.DatetimeIndex(
+                group["opened_date"].sort_values()
+            )
+        if component_scoped:
+            component_rows = confirmed.dropna(subset=["component"]).copy()
+            component_rows["_component_key"] = component_rows["component"].astype(str)
+            for key, group in component_rows.groupby(
+                ["_asset_key", "_component_key"], dropna=False
+            ):
+                failure_dates_by_key[(str(key[0]), str(key[1]))] = pd.DatetimeIndex(
+                    group["opened_date"].sort_values()
+                )
+
     # A missing work order can only mean "no event" when the asset is actually
     # covered by the outcome extract. Assets with no WO coverage remain useful
     # at scoring time, but must not silently become negative training examples.
@@ -197,18 +220,16 @@ def build_training_table(
         if pd.isna(observation_end) or sample_date + timedelta(days=int(horizon_days)) > observation_end:
             continue
 
-        future = wo_df[
-            (wo_df["asset_id"].astype(str) == str(asset_id))
-            & (wo_df["opened_date"] > sample_date)
-            & (wo_df["opened_date"] <= sample_date + timedelta(days=int(horizon_days)))
-            & wo_df["is_corrective"]
-            & wo_df["confirmed_failure"]
-        ]
-        if pd.notna(component) and wo_df["component"].notna().any():
-            future = future[future["component"].astype(str) == str(component)]
+        event_key = (
+            str(asset_id), str(component) if component_scoped and pd.notna(component) else None
+        )
+        future_dates = failure_dates_by_key.get(event_key, pd.DatetimeIndex([]))
+        horizon_end = sample_date + timedelta(days=int(horizon_days))
+        left = future_dates.searchsorted(sample_date, side="right")
+        right = future_dates.searchsorted(horizon_end, side="right")
 
         row = sample.to_dict()
-        row["corrective_wo_within_horizon"] = int(not future.empty)
+        row["corrective_wo_within_horizon"] = int(right > left)
         row["horizon_days"] = int(horizon_days)
         rows.append(row)
 
@@ -245,6 +266,29 @@ def build_scoring_table(
         set(wo_df["asset_id"].dropna().astype(str))
         if not wo_df.empty and "asset_id" in wo_df.columns else set()
     )
+    component_scoped = bool(
+        not wo_df.empty and "component" in wo_df.columns and wo_df["component"].notna().any()
+    )
+    prior_dates_by_key: dict[tuple[str, str | None], pd.DatetimeIndex] = {}
+    if not wo_df.empty:
+        corrective = wo_df.loc[
+            wo_df["is_corrective"] & wo_df["confirmed_failure"] & wo_df["opened_date"].notna()
+        ].copy()
+        if not corrective.empty:
+            corrective["_asset_key"] = corrective["asset_id"].astype(str)
+            for asset_key, group in corrective.groupby("_asset_key", dropna=False):
+                prior_dates_by_key[(str(asset_key), None)] = pd.DatetimeIndex(
+                    group["opened_date"].sort_values()
+                )
+            if component_scoped:
+                component_rows = corrective.dropna(subset=["component"]).copy()
+                component_rows["_component_key"] = component_rows["component"].astype(str)
+                for key, group in component_rows.groupby(
+                    ["_asset_key", "_component_key"], dropna=False
+                ):
+                    prior_dates_by_key[(str(key[0]), str(key[1]))] = pd.DatetimeIndex(
+                        group["opened_date"].sort_values()
+                    )
 
     rows: list[dict[str, Any]] = []
     for _, sample in samples.iterrows():
@@ -258,19 +302,15 @@ def build_scoring_table(
 
         prior_count: float = np.nan
         if asset_key in wo_assets:
-            prior = wo_df[
-                (wo_df["asset_id"].astype(str) == asset_key)
-                & (wo_df["opened_date"] < sample_date)
-                & wo_df["is_corrective"]
-                & wo_df["confirmed_failure"]
-            ]
-            if pd.notna(component) and wo_df["component"].notna().any():
-                prior = prior[prior["component"].astype(str) == str(component)]
-            prior_count = float(len(prior))
+            event_key = (
+                asset_key, str(component) if component_scoped and pd.notna(component) else None
+            )
+            prior_dates = prior_dates_by_key.get(event_key, pd.DatetimeIndex([]))
+            prior_count = float(prior_dates.searchsorted(sample_date, side="left"))
 
         measurements = [sample.get(column) for column in RAW_MEASUREMENT_COLUMNS]
         measurement_count = int(sum(pd.notna(value) for value in measurements))
-        interpretation_text = str(sample.get("interpretation_text", "") or "").strip()
+        interpretation_text = safe_text(sample.get("interpretation_text")).strip()
         row: dict[str, Any] = {
             "source_row": int(sample.get("source_row", len(rows))),
             "sample_number": sample["sample_number"],
@@ -284,7 +324,7 @@ def build_scoring_table(
             "lab_history_samples": int(sample["lab_history_samples"]),
             "lab_measurement_count": measurement_count,
             "lab_numeric_available": float(measurement_count > 0),
-            "lab_interpretation_code": str(sample.get("interpretation_code", "") or "").upper(),
+            "lab_interpretation_code": safe_text(sample.get("interpretation_code")).upper(),
             "lab_text_available": float(bool(interpretation_text)),
             "lab_text_length_log": float(np.log1p(len(interpretation_text))),
             "work_order_history_available": float(asset_key in wo_assets),
